@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="el">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>termi</title>
+  <link rel="stylesheet" href="../node_modules/@xterm/xterm/css/xterm.css" />
+  <link rel="stylesheet" href="../node_modules/@vscode/codicons/dist/codicon.css" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="toolbar">
+    <button id="toggleSidebar" title="Εξερευνητής αρχείων"><i class="codicon codicon-files"></i></button>
+    <button id="scmBtn" title="Source Control"><i class="codicon codicon-source-control"></i><span id="scmBadge" class="toolbar-badge"></span></button>
+    <button id="addPane" title="Νέο terminal (Ctrl+T)">+ termi</button>
+    <button id="remoteBtn" title="Άνοιγμα από κινητό (QR)"><i class="codicon codicon-radio-tower"></i></button>
+    <div class="toolbar-spacer"></div>
+    <div class="window-controls">
+      <button id="win-full" class="winbtn" title="Πλήρης οθόνη (F11)"><i class="codicon codicon-screen-full"></i></button>
+      <button id="win-min" class="winbtn" title="Ελαχιστοποίηση"><i class="codicon codicon-chrome-minimize"></i></button>
+      <button id="win-max" class="winbtn" title="Μεγιστοποίηση"><i class="codicon codicon-chrome-maximize"></i></button>
+      <button id="win-close" class="winbtn winbtn-close" title="Κλείσιμο"><i class="codicon codicon-chrome-close"></i></button>
+    </div>
+  </div>
+
+  <div id="main">
+    <div id="sidebar" class="hidden">
+      <div id="explorer-view" class="sidebar-view">
+        <div id="sidebar-head">
+          <div class="side-actions">
+            <button id="notesIndex" title="Σημειώσεις"><i class="codicon codicon-note"></i></button>
+            <button id="newFile" title="Νέο αρχείο"><i class="codicon codicon-new-file"></i></button>
+            <button id="newFolder" title="Νέος φάκελος"><i class="codicon codicon-new-folder"></i></button>
+            <button id="pickRoot" class="side-action-right" title="Άνοιγμα φακέλου"><i class="codicon codicon-folder-opened"></i></button>
+          </div>
+        </div>
+        <div id="tree"></div>
+      </div>
+
+      <div id="scm-view" class="sidebar-view hidden">
+        <div class="sidebar-head">
+          <span class="side-title">SOURCE CONTROL</span>
+          <div class="side-actions">
+            <button id="scmRefresh" title="Ανανέωση"><i class="codicon codicon-refresh"></i></button>
+          </div>
+        </div>
+        <div id="scm-body">
+          <div id="scm-branch"></div>
+          <textarea id="scm-message" placeholder="Μήνυμα (Ctrl+Enter για commit)" spellcheck="false"></textarea>
+          <button id="scm-commit"><i class="codicon codicon-check"></i> Commit</button>
+          <div id="scm-actions">
+            <button id="scm-pull" title="Pull"><i class="codicon codicon-arrow-down"></i> Pull</button>
+            <button id="scm-push" title="Push"><i class="codicon codicon-arrow-up"></i> Push</button>
+          </div>
+          <div id="scm-changes-head">Αλλαγές <span id="scm-count" class="scm-badge">0</span></div>
+          <div id="scm-changes"></div>
+        </div>
+      </div>
+    </div>
+    <div id="sidebar-resizer" title="Σύρε για αλλαγή πλάτους"></div>
+    <div id="workspace"></div>
+  </div>
+
+  <div id="overlay"></div>
+
+  <!-- Remote control (phone via QR) modal -->
+  <div id="remote-modal" class="remote-modal hidden">
+    <div class="remote-card">
+      <div class="remote-head">
+        <span><i class="codicon codicon-radio-tower"></i> Έλεγχος από κινητό</span>
+        <button id="remoteCloseX" class="remote-x" title="Κλείσιμο"><i class="codicon codicon-close"></i></button>
+      </div>
+
+      <div id="remote-idle" class="remote-body">
+        <p>Άνοιξε μια ασφαλή «πόρτα»: σκανάρεις το QR από το κινητό και χειρίζεσαι τα terminals από οπουδήποτε (ακόμη κι από άλλο δίκτυο). Οι εντολές τρέχουν εδώ στον υπολογιστή.</p>
+        <label class="remote-opt"><input type="checkbox" id="remoteReadOnly" /> Μόνο παρακολούθηση (read-only)</label>
+        <button id="remoteStart" class="remote-primary">Άνοιγμα πόρτας</button>
+        <div class="remote-note">Πρώτη φορά: κατεβαίνει μία φορά το cloudflared (~70MB).</div>
+      </div>
+
+      <div id="remote-loading" class="remote-body hidden">
+        <div class="remote-spinner"></div>
+        <div id="remoteLoadingText">Άνοιγμα ασφαλούς σήραγγας…</div>
+        <div id="remoteProgress" class="remote-progress hidden"><div id="remoteProgressBar"></div></div>
+      </div>
+
+      <div id="remote-active" class="remote-body hidden">
+        <img id="remoteQr" class="remote-qr" alt="QR" />
+        <div class="remote-pin-row">PIN: <b id="remotePin">––––––</b></div>
+        <div class="remote-url" id="remoteUrl"></div>
+        <div class="remote-clients" id="remoteClients"></div>
+        <button id="remoteStop" class="remote-danger">Κλείσιμο πόρτας</button>
+        <div class="remote-note">Σκάναρε το QR, μετά γράψε το PIN στο κινητό.</div>
+      </div>
+
+      <div id="remote-error" class="remote-body hidden">
+        <div class="remote-errtext" id="remoteErrText"></div>
+        <button id="remoteRetry" class="remote-primary">Δοκίμασε ξανά</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="../node_modules/@xterm/xterm/lib/xterm.js"></script>
+  <script src="../node_modules/@xterm/addon-fit/lib/addon-fit.js"></script>
+  <script src="../node_modules/marked/lib/marked.umd.js"></script>
+  <script src="../node_modules/monaco-editor/min/vs/loader.js"></script>
+  <script src="renderer.js"></script>
+  <script src="remote-client.js"></script>
+</body>
+</html>

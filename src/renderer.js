@@ -1,0 +1,2123 @@
+// ============================================================
+// termi — dynamic split-tree terminal manager (real terminals)
+// ============================================================
+//
+// Layout = binary split tree (BSP). Drag a pane by its bar, drop on
+// L/R/T/B of any pane to split it, center to swap. No fixed templates.
+//
+// Real terminals: each leaf owns a live xterm.js instance kept in `views`
+// and connected to a node-pty process in the main process. On layout
+// changes we MOVE the terminal's DOM node (never recreate it), so shell
+// sessions survive every re-render.
+
+const COLORS = ['#58a6ff', '#3fb950', '#f778ba', '#d29922', '#a371f7', '#ff7b72', '#39c5cf', '#db61a2'];
+let colorIdx = 0;
+let nextId = 1;
+
+function makeLeaf(name) {
+  const id = 'p' + (nextId++);
+  const color = COLORS[colorIdx++ % COLORS.length];
+  return { type: 'leaf', kind: 'terminal', id, name: name || ('terminal ' + id.slice(1)), color, cwd: null };
+}
+
+function makeEditorLeaf(filePath) {
+  const id = 'p' + (nextId++);
+  const color = COLORS[colorIdx++ % COLORS.length];
+  return { type: 'leaf', kind: 'editor', id, name: basename(filePath), color, filePath };
+}
+
+function basename(p) { return p ? p.split(/[\\/]/).pop() : ''; }
+function extOf(p) { const b = basename(p); const i = b.lastIndexOf('.'); return i > 0 ? b.slice(i + 1).toLowerCase() : ''; }
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'ico', 'avif', 'apng']);
+const VIDEO_EXTS = new Set(['mp4', 'webm', 'ogv', 'mov', 'm4v', 'mkv', 'avi']);
+const AUDIO_EXTS = new Set(['mp3', 'wav', 'ogg', 'oga', 'm4a', 'flac', 'aac', 'opus']);
+
+function detectMode(p) {
+  const e = extOf(p);
+  if (e === 'md' || e === 'markdown') return 'markdown';
+  if (e === 'html' || e === 'htm') return 'html';
+  if (e === 'csv') return 'csv';
+  if (IMAGE_EXTS.has(e)) return 'image';
+  if (VIDEO_EXTS.has(e)) return 'video';
+  if (AUDIO_EXTS.has(e)) return 'audio';
+  if (e === 'pdf') return 'pdf';
+  if (e === 'txt' || e === 'log' || e === '') return 'text';
+  return 'code';
+}
+const MEDIA_MODES = new Set(['image', 'video', 'audio', 'pdf']);
+
+function fileUrl(p) { return 'file:///' + encodeURI(p.replace(/\\/g, '/')); }
+
+const LANG_BY_EXT = {
+  js: 'javascript', mjs: 'javascript', cjs: 'javascript', jsx: 'javascript',
+  ts: 'typescript', tsx: 'typescript', json: 'json', html: 'html', htm: 'html',
+  css: 'css', scss: 'scss', less: 'less', py: 'python', java: 'java', c: 'c',
+  h: 'c', cpp: 'cpp', cc: 'cpp', hpp: 'cpp', cs: 'csharp', go: 'go', rs: 'rust',
+  rb: 'ruby', php: 'php', sh: 'shell', bash: 'shell', ps1: 'powershell',
+  xml: 'xml', yaml: 'yaml', yml: 'yaml', sql: 'sql', md: 'markdown', markdown: 'markdown',
+  toml: 'ini', ini: 'ini', dockerfile: 'dockerfile', vue: 'html', svelte: 'html',
+};
+function monacoLang(p) { return LANG_BY_EXT[extOf(p)] || 'plaintext'; }
+
+// ---------------- Monaco bootstrap ----------------
+let monaco = null;
+let monacoReady = false;
+const monacoQueue = [];
+function whenMonaco(cb) { if (monacoReady) cb(); else monacoQueue.push(cb); }
+(function loadMonaco() {
+  const vsBase = new URL('../node_modules/monaco-editor/min/vs/', window.location.href).href;
+  self.MonacoEnvironment = {
+    getWorkerUrl() {
+      return URL.createObjectURL(new Blob(
+        [`self.MonacoEnvironment={baseUrl:'${vsBase}'};importScripts('${vsBase}base/worker/workerMain.js');`],
+        { type: 'application/javascript' }
+      ));
+    },
+  };
+  require.config({ paths: { vs: vsBase.replace(/\/$/, '') } });
+  require(['vs/editor/editor.main'], function () {
+    monaco = window.monaco;
+    monacoReady = true;
+    monacoQueue.forEach((f) => f());
+    monacoQueue.length = 0;
+  }, function (err) {
+    console.error('[termi] monaco failed to load:', err && (err.message || err));
+  });
+})();
+
+let root = makeLeaf();
+let focusedId = root.id;
+let fullscreenId = null;
+
+const workspace = document.getElementById('workspace');
+const overlay = document.getElementById('overlay');
+
+// ---------------- global command launchers ----------------
+// Reusable buttons shown in every pane. Clicking runs in THAT pane.
+// { id, name, cwd, command, color }
+function loadLaunchers() {
+  try { return JSON.parse(localStorage.getItem('termi.launchers') || '[]'); }
+  catch { return []; }
+}
+function saveLaunchers() {
+  localStorage.setItem('termi.launchers', JSON.stringify(launchers));
+}
+let launchers = loadLaunchers();
+
+function runLauncher(L, paneId) {
+  if (!views.get(paneId)) return;
+  if (L.cwd) window.termi.write(paneId, ` cd "${L.cwd}"\r`);
+  if (L.command) window.termi.write(paneId, `${L.command}\r`);
+  focusTerminal(paneId);
+}
+function deleteLauncher(id) {
+  launchers = launchers.filter((l) => l.id !== id);
+  saveLaunchers();
+  render();
+}
+
+// ---------------- terminal view cache ----------------
+// id -> { el, term, fit, ro, opened, started }
+const views = new Map();
+
+const TERM_THEME = {
+  background: '#0d1117',
+  foreground: '#c9d1d9',
+  cursor: '#58a6ff',
+  selectionBackground: 'rgba(88,166,255,0.3)',
+  black: '#484f58', red: '#ff7b72', green: '#3fb950', yellow: '#d29922',
+  blue: '#58a6ff', magenta: '#bc8cff', cyan: '#39c5cf', white: '#b1bac4',
+};
+
+function mountView(leaf) {
+  let v = views.get(leaf.id);
+  if (v) return v;
+
+  const el = document.createElement('div');
+  el.className = 'term-host';
+
+  const term = new Terminal({
+    fontFamily: '"Cascadia Code", "Consolas", monospace',
+    fontSize: leaf.fontSize || 13,
+    cursorBlink: true,
+    allowProposedApi: true,
+    theme: TERM_THEME,
+  });
+  const fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.onData((d) => window.termi.write(leaf.id, d));
+
+  const ro = new ResizeObserver(() => scheduleFit(leaf.id));
+  ro.observe(el);
+
+  // Drag & drop file/folder paths from the explorer (or the OS) into the terminal.
+  // Writes the path(s) to the prompt WITHOUT a newline so nothing auto-executes.
+  el.addEventListener('dragover', (e) => {
+    const isFiles = e.dataTransfer && e.dataTransfer.types && [...e.dataTransfer.types].includes('Files');
+    if (draggedPaths.length || isFiles) {
+      e.preventDefault();
+      // Must match the source's effectAllowed ('move' for explorer rows) or the
+      // browser shows "not-allowed" and never fires the drop event.
+      e.dataTransfer.dropEffect = isFiles ? 'copy' : 'move';
+      el.classList.add('term-droptarget');
+    }
+  });
+  el.addEventListener('dragleave', (e) => {
+    if (!el.contains(e.relatedTarget)) el.classList.remove('term-droptarget');
+  });
+  el.addEventListener('drop', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    el.classList.remove('term-droptarget');
+    let paths = [];
+    if (draggedPaths.length) {
+      paths = [...draggedPaths];
+    } else if (e.dataTransfer.files && e.dataTransfer.files.length) {
+      paths = [...e.dataTransfer.files].map((f) => f.path).filter(Boolean);
+    } else {
+      const t = e.dataTransfer.getData('text/plain');
+      if (t) paths = [t];
+    }
+    if (!paths.length) return;
+    const text = paths.map(quoteForShell).join(' ') + ' ';
+    window.termi.write(leaf.id, text);
+    focusTerminal(leaf.id);
+    draggedPaths = []; draggedPath = null;
+  });
+
+  // Right-click: copy if there's a selection, otherwise paste from the clipboard.
+  el.addEventListener('contextmenu', async (e) => {
+    e.preventDefault();
+    const sel = term.getSelection();
+    if (sel) {
+      window.termi.clipboardWrite(sel);
+      term.clearSelection();
+    } else {
+      const text = await window.termi.clipboardRead();
+      if (text) window.termi.write(leaf.id, text);
+    }
+    term.focus();
+  });
+
+  v = { kind: 'terminal', el, term, fit, ro, opened: false, started: false, lastCols: 0, lastRows: 0 };
+  views.set(leaf.id, v);
+  return v;
+}
+
+const fitPending = new Set();
+function scheduleFit(id) {
+  if (fitPending.has(id)) return;
+  fitPending.add(id);
+  requestAnimationFrame(() => {
+    fitPending.delete(id);
+    activateView(id);
+  });
+}
+
+function activateView(id) {
+  const v = views.get(id);
+  if (!v || v.kind !== 'terminal' || !v.el.isConnected) return;
+  if (!v.opened) { v.term.open(v.el); v.opened = true; }
+  try { v.fit.fit(); } catch { /* element not measurable yet */ }
+  const cols = v.term.cols, rows = v.term.rows;
+  if (cols < 1 || rows < 1) return;
+  if (!v.started) {
+    const leaf = findLeaf(id);
+    window.termi.spawn(id, leaf ? leaf.cwd : null, cols, rows);
+    v.started = true;
+    v.lastCols = cols; v.lastRows = rows;
+    return; // spawn already used these dims; no extra resize needed
+  }
+  // Only resize the pty when the geometry actually changed. Resizing on every
+  // ResizeObserver tick makes PowerShell/PSReadLine repaint the input line,
+  // which is what caused the duplicated/garbled text.
+  if (cols !== v.lastCols || rows !== v.lastRows) {
+    v.lastCols = cols; v.lastRows = rows;
+    window.termi.resize(id, cols, rows);
+  }
+}
+
+// ---- content zoom (font size of the pane's content, not the pane itself) ----
+const ZOOM_MIN = 6, ZOOM_MAX = 40, ZOOM_DEFAULT = 13;
+const zoomLabels = new Map(); // leaf.id -> percentage label element (refreshed each render)
+function zoomPct(leaf) { return Math.round(((leaf.fontSize || ZOOM_DEFAULT) / ZOOM_DEFAULT) * 100) + '%'; }
+function updateZoomLabel(leaf) {
+  const el = zoomLabels.get(leaf.id);
+  if (el) el.textContent = zoomPct(leaf);
+}
+function setZoom(leaf, size) {
+  const next = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, size));
+  if (next === (leaf.fontSize || ZOOM_DEFAULT)) return;
+  leaf.fontSize = next;
+  const v = views.get(leaf.id);
+  if (v) v.fontSize = next;
+  applyZoom(leaf);
+  updateZoomLabel(leaf);
+}
+function zoomLeaf(leaf, delta) { setZoom(leaf, (leaf.fontSize || ZOOM_DEFAULT) + delta); }
+function applyZoom(leaf) {
+  const v = views.get(leaf.id);
+  if (!v) return;
+  const fs = leaf.fontSize || 13;
+  if (v.kind === 'terminal') {
+    try { v.term.options.fontSize = fs; } catch { /* */ }
+    v.lastCols = v.lastRows = 0; // force a real refit at the new cell size
+    scheduleFit(leaf.id);
+  } else if (v.kind === 'editor') {
+    if (v.editor) v.editor.updateOptions({ fontSize: fs });
+    // CSV table + markdown/html rendered preview scale via font-size.
+    if (v.preview) v.preview.style.fontSize = fs + 'px';
+  }
+}
+function makeZoomButtons(leaf) {
+  const out = document.createElement('button');
+  out.className = 'zoom-btn';
+  out.innerHTML = '<i class="codicon codicon-zoom-out"></i>';
+  out.title = 'Σμίκρυνση περιεχομένου';
+  out.addEventListener('click', (e) => { e.stopPropagation(); zoomLeaf(leaf, -1); });
+
+  const pct = document.createElement('span');
+  pct.className = 'zoom-pct';
+  pct.textContent = zoomPct(leaf);
+  pct.title = 'Επαναφορά στο 100%';
+  pct.addEventListener('click', (e) => { e.stopPropagation(); setZoom(leaf, ZOOM_DEFAULT); });
+  zoomLabels.set(leaf.id, pct);
+
+  const inc = document.createElement('button');
+  inc.className = 'zoom-btn';
+  inc.innerHTML = '<i class="codicon codicon-zoom-in"></i>';
+  inc.title = 'Μεγέθυνση περιεχομένου';
+  inc.addEventListener('click', (e) => { e.stopPropagation(); zoomLeaf(leaf, +1); });
+  return [out, pct, inc];
+}
+
+// Lock button (editor panes). Unlocked = the next file opened reuses this pane;
+// locked = this pane is pinned to its file and new files open in a new pane.
+function makeLockButton(leaf) {
+  const btn = document.createElement('button');
+  function paint() {
+    btn.className = 'lock-btn' + (leaf.locked ? ' locked' : '');
+    btn.innerHTML = `<i class="codicon codicon-${leaf.locked ? 'lock' : 'unlock'}"></i>`;
+    btn.title = leaf.locked
+      ? 'Κλειδωμένο: νέα αρχεία ανοίγουν σε νέο pane'
+      : 'Ξεκλείδωτο: νέα αρχεία ανοίγουν εδώ';
+  }
+  paint();
+  btn.addEventListener('click', (e) => { e.stopPropagation(); leaf.locked = !leaf.locked; paint(); });
+  return btn;
+}
+
+function destroyView(id) {
+  const v = views.get(id);
+  if (!v) return;
+  try { v.ro.disconnect(); } catch { /* */ }
+  if (v.kind === 'terminal') {
+    window.termi.kill(id);
+    try { v.term.dispose(); } catch { /* */ }
+  } else if (v.kind === 'editor') {
+    clearTimeout(v.saveTimer);
+    if (v.dirty && v.editor) window.termi.writeFile(v.filePath, v.editor.getModel().getValue());
+    try { v.editor && v.editor.dispose(); } catch { /* */ }
+    try { v.model && v.model.dispose(); } catch { /* */ }
+  }
+  views.delete(id);
+}
+
+// pipe pty output -> xterm (registered once)
+window.termi.onData(({ id, data }) => {
+  const v = views.get(id);
+  if (v && v.kind === 'terminal') v.term.write(data);
+});
+window.termi.onExit(({ id }) => {
+  const v = views.get(id);
+  if (v && v.kind === 'terminal') v.term.write('\r\n\x1b[90m[process exited]\x1b[0m\r\n');
+});
+
+// ---------------- editor view cache ----------------
+
+function mountEditorView(leaf) {
+  let v = views.get(leaf.id);
+  if (v) return v;
+
+  const el = document.createElement('div');
+  el.className = 'editor-host';
+  const codeWrap = document.createElement('div');
+  codeWrap.className = 'editor-code';
+  const preview = document.createElement('div');
+  preview.className = 'editor-preview';
+  preview.style.display = 'none';
+  el.append(codeWrap, preview);
+
+  const mode = detectMode(leaf.filePath);
+  v = {
+    kind: 'editor', el, codeWrap, preview,
+    fontSize: leaf.fontSize || 13,
+    filePath: leaf.filePath, mode,
+    editor: null, model: null, iframe: null,
+    showPreview: (mode === 'markdown' || mode === 'html'),
+    ro: null, saveTimer: null, dirty: false, statusText: '', statusEl: null,
+  };
+  const ro = new ResizeObserver(() => { if (v.editor) v.editor.layout(); });
+  ro.observe(el);
+  v.ro = ro;
+  views.set(leaf.id, v);
+
+  loadEditorFile(v);
+  return v;
+}
+
+function renderMedia(v) {
+  v.codeWrap.style.display = 'none';
+  v.preview.style.display = 'block';
+  v.preview.className = 'editor-preview media-view';
+  v.preview.innerHTML = '';
+  const url = fileUrl(v.filePath);
+  let el;
+  if (v.mode === 'image') {
+    el = document.createElement('img');
+    el.className = 'media-img';
+    el.src = url;
+  } else if (v.mode === 'video') {
+    el = document.createElement('video');
+    el.className = 'media-video';
+    el.controls = true;
+    el.src = url;
+  } else if (v.mode === 'audio') {
+    el = document.createElement('audio');
+    el.className = 'media-audio';
+    el.controls = true;
+    el.src = url;
+  } else { // pdf
+    el = document.createElement('iframe');
+    el.className = 'media-pdf';
+    el.src = url;
+  }
+  v.preview.appendChild(el);
+}
+
+async function loadEditorFile(v) {
+  v.mode = detectMode(v.filePath);
+
+  if (MEDIA_MODES.has(v.mode)) { renderMedia(v); return; }
+
+  const res = await window.termi.readFile(v.filePath);
+  const content = res.ok ? res.value : `Αδυναμία ανοίγματος αρχείου:\n${res.error || ''}`;
+
+  if (v.mode === 'csv') {
+    v.codeWrap.style.display = 'none';
+    v.preview.style.display = 'block';
+    v.preview.className = 'editor-preview csv-view';
+    v.csv = content;
+    v.preview.innerHTML = renderCsv(content);
+    return;
+  }
+
+  whenMonaco(() => {
+    const lang = v.mode === 'markdown' ? 'markdown' : monacoLang(v.filePath);
+    if (!v.editor) {
+      v.editor = monaco.editor.create(v.codeWrap, {
+        value: content,
+        language: lang,
+        theme: 'vs-dark',
+        automaticLayout: false,
+        minimap: { enabled: false },
+        fontSize: v.fontSize || 13,
+        fontFamily: '"Cascadia Code", "Consolas", monospace',
+        scrollBeyondLastLine: false,
+        wordWrap: v.mode === 'markdown' || v.mode === 'text' ? 'on' : 'off',
+        tabSize: 2,
+        scrollbar: { verticalScrollbarSize: 9, horizontalScrollbarSize: 9, useShadows: false },
+      });
+      v.model = v.editor.getModel();
+      v.editor.onDidChangeModelContent(() => scheduleSave(v));
+    } else {
+      const old = v.editor.getModel();
+      const m = monaco.editor.createModel(content, lang);
+      v.editor.setModel(m);
+      v.model = m;
+      if (old) old.dispose();
+    }
+    if (v.mode === 'markdown' || v.mode === 'html') { v.showPreview = true; applyPreview(v); }
+    else { v.showPreview = false; v.codeWrap.style.display = 'block'; v.preview.style.display = 'none'; v.editor.layout(); }
+  });
+}
+
+function applyPreview(v) {
+  if (v.showPreview) {
+    if (v.mode === 'markdown') {
+      const md = v.editor ? v.editor.getModel().getValue() : '';
+      v.preview.className = 'editor-preview md-view';
+      v.preview.innerHTML = window.marked ? window.marked.parse(md) : '<pre>' + escapeHtml(md) + '</pre>';
+    } else if (v.mode === 'html') {
+      v.preview.className = 'editor-preview html-view';
+      showHtmlPreview(v);
+    }
+    v.preview.style.display = 'block';
+    v.codeWrap.style.display = 'none';
+  } else {
+    v.codeWrap.style.display = 'block';
+    v.preview.style.display = 'none';
+    if (v.editor) v.editor.layout();
+  }
+}
+
+async function showHtmlPreview(v) {
+  // flush any pending save so the rendered page reflects the latest edits
+  clearTimeout(v.saveTimer);
+  if (v.editor && v.dirty) {
+    await window.termi.writeFile(v.filePath, v.editor.getModel().getValue());
+    v.dirty = false;
+    setEditorStatus(v, 'αποθηκεύτηκε ✓');
+  }
+  if (!v.iframe) {
+    v.iframe = document.createElement('iframe');
+    v.iframe.className = 'html-frame';
+    v.preview.appendChild(v.iframe);
+  }
+  // cache-bust so reloading after edits shows fresh content
+  v.iframe.src = fileUrl(v.filePath) + '?t=' + new Date().getTime();
+}
+
+function scheduleSave(v) {
+  if (v.reloading) return; // content was just refreshed from disk, not a user edit
+  v.dirty = true;
+  setEditorStatus(v, '…');
+  clearTimeout(v.saveTimer);
+  v.saveTimer = setTimeout(async () => {
+    const data = v.editor.getModel().getValue();
+    const res = await window.termi.writeFile(v.filePath, data);
+    v.dirty = false;
+    setEditorStatus(v, res.ok ? 'αποθηκεύτηκε ✓' : 'σφάλμα ⚠');
+  }, 400);
+}
+
+function setEditorStatus(v, text) {
+  v.statusText = text;
+  if (v.statusEl) v.statusEl.textContent = text;
+}
+
+// Reload open editor panels whose file changed on disk (e.g. a benchmark rewriting
+// output). Skips panels with unsaved edits so we never clobber what you're typing.
+// Our own auto-save can't loop this: after a save, disk === model, so nothing reloads.
+async function refreshOpenEditors() {
+  for (const v of views.values()) {
+    if (v.kind !== 'editor' || v.dirty) continue;
+    if (MEDIA_MODES.has(v.mode)) {
+      // Re-point image/pdf at the file with a cache-bust; leave video/audio playback alone.
+      if (v.mode === 'image' || v.mode === 'pdf') {
+        const m = v.preview.querySelector('img, iframe');
+        if (m) m.src = fileUrl(v.filePath) + '?t=' + Date.now();
+      }
+      continue;
+    }
+    const res = await window.termi.readFile(v.filePath);
+    if (!res.ok) continue; // file gone/unreadable — leave the panel as-is
+    const disk = res.value;
+    if (v.mode === 'csv') {
+      if (v.csv !== disk) { v.csv = disk; v.preview.innerHTML = renderCsv(disk); }
+      continue;
+    }
+    if (!v.editor || !v.model || v.model.getValue() === disk) continue;
+    v.reloading = true;
+    const state = v.editor.saveViewState();
+    v.model.setValue(disk);
+    if (state) v.editor.restoreViewState(state);
+    v.reloading = false;
+    v.dirty = false;
+    setEditorStatus(v, 'ανανεώθηκε ↻');
+    if (v.showPreview && (v.mode === 'markdown' || v.mode === 'html')) applyPreview(v);
+  }
+}
+
+// ---------------- CSV viewer ----------------
+
+function parseCsv(text) {
+  const rows = []; let row = []; let cur = ''; let inQ = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inQ) {
+      if (ch === '"') { if (text[i + 1] === '"') { cur += '"'; i++; } else inQ = false; }
+      else cur += ch;
+    } else if (ch === '"') inQ = true;
+    else if (ch === ',') { row.push(cur); cur = ''; }
+    else if (ch === '\n') { row.push(cur); rows.push(row); row = []; cur = ''; }
+    else if (ch === '\r') { /* skip */ }
+    else cur += ch;
+  }
+  if (cur.length || row.length) { row.push(cur); rows.push(row); }
+  return rows;
+}
+
+function renderCsv(text) {
+  const rows = parseCsv(text);
+  if (!rows.length) return '<div class="tree-empty">Άδειο CSV</div>';
+  let html = '<table class="csv-table">';
+  rows.forEach((r, i) => {
+    const tag = i === 0 ? 'th' : 'td';
+    html += '<tr><td class="csv-rownum">' + (i === 0 ? '#' : i) + '</td>' +
+      r.map((c) => `<${tag}>${escapeHtml(c)}</${tag}>`).join('') + '</tr>';
+  });
+  return html + '</table>';
+}
+
+// ---------------- open file in editor pane ----------------
+
+// The editor pane that should receive the next opened file, when one is reusable.
+let activeEditorId = null;
+
+// Pick an unlocked editor pane to reuse for a newly-opened file:
+// the focused pane if it qualifies, else the last one we opened into, else any.
+function reusableEditorLeaf() {
+  const f = findLeaf(focusedId);
+  if (f && f.kind === 'editor' && !f.locked) return f;
+  if (activeEditorId) {
+    const a = findLeaf(activeEditorId);
+    if (a && a.kind === 'editor' && !a.locked) return a;
+  }
+  let found = null;
+  (function walk(n) {
+    if (found || !n) return;
+    if (n.type === 'leaf') { if (n.kind === 'editor' && !n.locked) found = n; }
+    else n.children.forEach(walk);
+  })(root);
+  return found;
+}
+
+function openFile(filePath) {
+  // already open? just focus that panel
+  for (const [id, v] of views) {
+    if (v.kind === 'editor' && v.filePath === filePath) {
+      focusedId = id;
+      activeEditorId = id;
+      updateFocusClasses();
+      focusView(id);
+      return;
+    }
+  }
+  // reuse an unlocked editor pane in place (keeps the layout put), unless none exist
+  const reuse = reusableEditorLeaf();
+  if (reuse) {
+    destroyView(reuse.id);          // flush+dispose the old file's editor first
+    reuse.filePath = filePath;
+    reuse.name = basename(filePath);
+    focusedId = reuse.id;
+    activeEditorId = reuse.id;
+    render();
+    return;
+  }
+  // otherwise open as a NEW editor panel in the orchestra
+  const leaf = makeEditorLeaf(filePath);
+  if (!root) {
+    root = leaf;
+  } else {
+    const target = findLeaf(focusedId) || firstLeaf(root);
+    splitTarget(target, leaf, 'right');
+  }
+  focusedId = leaf.id;
+  activeEditorId = leaf.id;
+  render();
+}
+
+// ---------------- tree helpers ----------------
+
+function findLeaf(id) {
+  function walk(node) {
+    if (!node) return null;
+    if (node.type === 'leaf') return node.id === id ? node : null;
+    for (const c of node.children) { const r = walk(c); if (r) return r; }
+    return null;
+  }
+  return walk(root);
+}
+
+function firstLeaf(node) {
+  return node.type === 'leaf' ? node : firstLeaf(node.children[0]);
+}
+
+function findParentInfo(target) {
+  function walk(node) {
+    if (node.type === 'split') {
+      for (let i = 0; i < node.children.length; i++) {
+        if (node.children[i] === target) return { parent: node, index: i };
+        const r = walk(node.children[i]);
+        if (r) return r;
+      }
+    }
+    return null;
+  }
+  return walk(root);
+}
+
+function replaceNode(target, replacement) {
+  if (target === root) { root = replacement; return; }
+  const info = findParentInfo(target);
+  if (info) info.parent.children[info.index] = replacement;
+}
+
+function removeLeaf(leaf) {
+  const info = findParentInfo(leaf);
+  if (!info) return false;
+  const sibling = info.parent.children[1 - info.index];
+  replaceNode(info.parent, sibling);
+  return true;
+}
+
+function splitTarget(target, newLeaf, zone) {
+  const dir = (zone === 'left' || zone === 'right') ? 'row' : 'col';
+  const first = (zone === 'left' || zone === 'top');
+  const children = first ? [newLeaf, target] : [target, newLeaf];
+  replaceNode(target, { type: 'split', dir, children, sizes: [50, 50] });
+}
+
+function swapNodes(a, b) {
+  const ia = findParentInfo(a), ib = findParentInfo(b);
+  if (!ia || !ib) return; // root involved => only one leaf, nothing to swap
+  ia.parent.children[ia.index] = b;
+  ib.parent.children[ib.index] = a;
+}
+
+function visibleLeafIds() {
+  if (fullscreenId) return [fullscreenId];
+  const ids = [];
+  (function walk(n) {
+    if (n.type === 'leaf') ids.push(n.id);
+    else n.children.forEach(walk);
+  })(root);
+  return ids;
+}
+
+// ---------------- rendering ----------------
+
+function render() {
+  workspace.innerHTML = '';
+  if (!root) { renderEmptyState(); return; }
+  if (fullscreenId) {
+    const leaf = findLeaf(fullscreenId);
+    if (leaf) {
+      const p = renderPane(leaf);
+      p.style.position = 'absolute';
+      p.style.inset = '6px';
+      workspace.appendChild(p);
+    } else {
+      fullscreenId = null;
+      workspace.appendChild(renderNode(root));
+    }
+  } else {
+    workspace.appendChild(renderNode(root));
+  }
+  visibleLeafIds().forEach(scheduleFit);
+}
+
+function renderEmptyState() {
+  const wrap = document.createElement('div');
+  wrap.className = 'empty-state';
+  const btn = document.createElement('button');
+  btn.className = 'empty-add';
+  btn.textContent = '+ Νέο terminal';
+  btn.addEventListener('click', addPane);
+  const hint = document.createElement('div');
+  hint.className = 'empty-hint';
+  hint.textContent = 'Ctrl+T';
+  wrap.append(btn, hint);
+  workspace.appendChild(wrap);
+}
+
+function renderNode(node) {
+  return node.type === 'leaf' ? renderPane(node) : renderSplit(node);
+}
+
+function renderSplit(node) {
+  const el = document.createElement('div');
+  el.className = 'node ' + node.dir;
+  const childEls = [];
+  node.children.forEach((child, i) => {
+    const c = renderNode(child);
+    c.style.flexGrow = '0';
+    c.style.flexShrink = '1';
+    c.style.flexBasis = node.sizes[i] + '%';
+    childEls.push(c);
+    el.appendChild(c);
+    if (i < node.children.length - 1) {
+      el.appendChild(makeDivider(node, i, el, childEls));
+    }
+  });
+  return el;
+}
+
+function makeDivider(node, i, containerEl, childEls) {
+  const d = document.createElement('div');
+  d.className = 'divider ' + (node.dir === 'row' ? 'row-divider' : 'col-divider');
+  d.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    d.setPointerCapture(e.pointerId);
+    d.classList.add('dragging');
+    const horizontal = node.dir === 'row';
+    const total = horizontal ? containerEl.clientWidth : containerEl.clientHeight;
+    const startPos = horizontal ? e.clientX : e.clientY;
+    const startA = node.sizes[i];
+    const sumAB = node.sizes[i] + node.sizes[i + 1];
+    const MIN = 8;
+
+    function move(ev) {
+      const pos = horizontal ? ev.clientX : ev.clientY;
+      const deltaPct = (pos - startPos) / total * 100;
+      let a = Math.max(MIN, Math.min(sumAB - MIN, startA + deltaPct));
+      node.sizes[i] = a;
+      node.sizes[i + 1] = sumAB - a;
+      childEls[i].style.flexBasis = node.sizes[i] + '%';
+      childEls[i + 1].style.flexBasis = node.sizes[i + 1] + '%';
+    }
+    function up() {
+      d.classList.remove('dragging');
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+    }
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  });
+  return d;
+}
+
+function renderPane(leaf) {
+  const pane = document.createElement('div');
+  pane.className = 'pane' + (leaf.id === focusedId ? ' focused' : '');
+  pane.dataset.id = leaf.id;
+  pane.style.borderColor = leaf.color;
+
+  // --- bar ---
+  const bar = document.createElement('div');
+  bar.className = 'pane-bar';
+
+  const dot = document.createElement('span');
+  dot.className = 'dot';
+  dot.style.background = leaf.color;
+  dot.title = 'Χρώμα πλαισίου';
+
+  const colorInput = document.createElement('input');
+  colorInput.type = 'color';
+  colorInput.className = 'color-input';
+  colorInput.value = leaf.color;
+  dot.addEventListener('click', (e) => { e.stopPropagation(); colorInput.click(); });
+  colorInput.addEventListener('input', () => {
+    leaf.color = colorInput.value;
+    pane.style.borderColor = leaf.color;
+    dot.style.background = leaf.color;
+  });
+
+  const name = document.createElement('input');
+  name.className = 'pane-name';
+  name.value = leaf.name;
+  name.spellcheck = false;
+  name.addEventListener('change', () => { leaf.name = name.value; });
+
+  const fsBtn = document.createElement('button');
+  // 'bar-essential' keeps these two visible even when a very narrow pane
+  // collapses the rest of the header onto / off the second line (styles.css @container).
+  fsBtn.className = 'fs-btn bar-essential';
+  fsBtn.textContent = fullscreenId === leaf.id ? '🗗' : '⛶';
+  fsBtn.title = 'Fullscreen';
+  fsBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    fullscreenId = fullscreenId === leaf.id ? null : leaf.id;
+    render();
+  });
+
+  const closeBtn = document.createElement('button');
+  closeBtn.className = 'close-btn bar-essential';
+  closeBtn.textContent = '✕';
+  closeBtn.title = 'Κλείσιμο';
+  closeBtn.addEventListener('click', (e) => { e.stopPropagation(); closePane(leaf); });
+
+  // --- kind-specific bar buttons + body ---
+  const body = document.createElement('div');
+  let launcherBar = null;
+
+  if (leaf.kind === 'editor') {
+    pane.classList.add('editor-pane');
+    const v = mountEditorView(leaf);
+
+    const midBtns = [];
+    if (v.mode === 'markdown' || v.mode === 'html') {
+      const mdBtn = document.createElement('button');
+      mdBtn.textContent = v.showPreview ? '✎ raw' : '👁 view';
+      mdBtn.title = 'Εναλλαγή raw / προβολή';
+      mdBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        v.showPreview = !v.showPreview;
+        mdBtn.textContent = v.showPreview ? '✎ raw' : '👁 view';
+        applyPreview(v);
+      });
+      midBtns.push(mdBtn);
+    }
+    const status = document.createElement('span');
+    status.className = 'edit-status';
+    status.textContent = v.statusText;
+    v.statusEl = status;
+
+    bar.append(dot, colorInput, name, makeLockButton(leaf), ...makeZoomButtons(leaf), ...midBtns, status, fsBtn, closeBtn);
+    body.className = 'pane-body editor-body';
+    if (v.preview) v.preview.style.fontSize = (leaf.fontSize || 13) + 'px';
+    body.appendChild(v.el);
+  } else {
+    const launcherBtn = document.createElement('button');
+    launcherBtn.textContent = '⚡';
+    launcherBtn.title = 'Νέο κουμπί εντολής';
+    launcherBtn.addEventListener('click', (e) => { e.stopPropagation(); openLauncherModal(); });
+
+    const folderBtn = document.createElement('button');
+    folderBtn.textContent = '📁';
+    folderBtn.title = 'Ορισμός φακέλου εργασίας';
+    folderBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const p = await window.termi.pickFolder(leaf.cwd);
+      if (!p) return;
+      leaf.cwd = p;
+      folderBtn.title = 'Φάκελος: ' + p;
+      const v = views.get(leaf.id);
+      if (v && v.started) window.termi.write(leaf.id, ` cd "${p}"\r`);
+    });
+
+    bar.append(dot, colorInput, name, ...makeZoomButtons(leaf), launcherBtn, folderBtn, fsBtn, closeBtn);
+    launcherBar = launchers.length ? renderLauncherBar(leaf) : null;
+    body.className = 'pane-body';
+    body.appendChild(mountView(leaf).el);
+  }
+
+  bar.addEventListener('pointerdown', (e) => startPaneDrag(e, leaf));
+  pane.addEventListener('pointerdown', () => { focusedId = leaf.id; updateFocusClasses(); focusView(leaf.id); });
+
+  if (launcherBar) pane.append(bar, launcherBar, body);
+  else pane.append(bar, body);
+  return pane;
+}
+
+function focusView(id) {
+  const v = views.get(id);
+  if (!v) return;
+  if (v.kind === 'terminal' && v.opened) { try { v.term.focus(); } catch { /* */ } }
+  else if (v.kind === 'editor' && v.editor) { try { v.editor.focus(); } catch { /* */ } }
+}
+
+function renderLauncherBar(leaf) {
+  const lb = document.createElement('div');
+  lb.className = 'launcher-bar';
+  launchers.forEach((L) => {
+    const chip = document.createElement('button');
+    chip.className = 'launcher-chip';
+    chip.dataset.lid = L.id;
+    chip.style.borderColor = L.color || 'var(--border)';
+    const tip = [];
+    if (L.cwd) tip.push('📁 ' + L.cwd);
+    if (L.command) tip.push('▸ ' + L.command);
+    chip.title = tip.join('\n');
+
+    const label = document.createElement('span');
+    label.className = 'chip-label';
+    label.textContent = L.name;
+    const del = document.createElement('span');
+    del.className = 'chip-del';
+    del.textContent = '✕';
+    del.title = 'Διαγραφή κουμπιού';
+    del.addEventListener('click', (e) => { e.stopPropagation(); deleteLauncher(L.id); });
+
+    chip.append(label, del);
+    // pointerdown -> potential drag-to-reorder; a plain click (no drag) runs it
+    chip.addEventListener('pointerdown', (e) => startChipDrag(e, L, leaf.id, chip, lb));
+    lb.appendChild(chip);
+  });
+  return lb;
+}
+
+function startChipDrag(e, L, paneId, chip, bar) {
+  if (e.button !== 0) return;
+  if (e.target.closest('.chip-del')) return; // let delete handle it
+  const startX = e.clientX, startY = e.clientY;
+  let dragging = false;
+
+  function move(ev) {
+    if (!dragging) {
+      if (Math.hypot(ev.clientX - startX, ev.clientY - startY) < 5) return;
+      dragging = true;
+      chip.classList.add('chip-dragging');
+    }
+    const siblings = [...bar.querySelectorAll('.launcher-chip:not(.chip-dragging)')];
+    let next = null;
+    for (const s of siblings) {
+      const r = s.getBoundingClientRect();
+      if (ev.clientX < r.left + r.width / 2) { next = s; break; }
+    }
+    if (next) bar.insertBefore(chip, next);
+    else bar.appendChild(chip);
+  }
+  function up() {
+    window.removeEventListener('pointermove', move);
+    window.removeEventListener('pointerup', up);
+    chip.classList.remove('chip-dragging');
+    if (!dragging) { runLauncher(L, paneId); return; }
+    const order = [...bar.querySelectorAll('.launcher-chip')].map((c) => c.dataset.lid);
+    launchers.sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
+    saveLaunchers();
+    render();
+  }
+  window.addEventListener('pointermove', move);
+  window.addEventListener('pointerup', up);
+}
+
+function focusTerminal(id) {
+  const v = views.get(id);
+  if (v && v.opened) { try { v.term.focus(); } catch { /* */ } }
+}
+
+function updateFocusClasses() {
+  document.querySelectorAll('.pane').forEach((p) => {
+    p.classList.toggle('focused', p.dataset.id === focusedId);
+  });
+}
+
+// ---------------- pane actions ----------------
+
+function addPane() {
+  if (fullscreenId) fullscreenId = null;
+  const leaf = makeLeaf();
+  if (!root) {
+    root = leaf;
+    focusedId = leaf.id;
+    render();
+    return;
+  }
+  const target = findLeaf(focusedId) || firstLeaf(root);
+  splitTarget(target, leaf, 'right');
+  focusedId = leaf.id;
+  render();
+}
+
+function closePane(leaf) {
+  if (fullscreenId === leaf.id) fullscreenId = null;
+  destroyView(leaf.id);
+  if (root === leaf) {
+    // closing the last pane -> empty workspace
+    root = null;
+    focusedId = null;
+    render();
+    return;
+  }
+  removeLeaf(leaf);
+  if (focusedId === leaf.id) focusedId = firstLeaf(root).id;
+  render();
+}
+
+// ---------------- drag + snap zones ----------------
+
+let currentDrop = null;
+let zonesEl = null;
+
+function startPaneDrag(e, leaf) {
+  if (e.button !== 0) return;
+  if (e.target.closest('button, input')) return;
+  const startX = e.clientX, startY = e.clientY;
+  let dragging = false;
+  let ghost = null;
+
+  function move(ev) {
+    if (!dragging) {
+      if (Math.hypot(ev.clientX - startX, ev.clientY - startY) < 6) return;
+      dragging = true;
+      document.body.classList.add('dragging');
+      ghost = document.createElement('div');
+      ghost.className = 'drag-ghost';
+      ghost.textContent = leaf.name;
+      overlay.appendChild(ghost);
+    }
+    ghost.style.left = (ev.clientX + 12) + 'px';
+    ghost.style.top = (ev.clientY + 14) + 'px';
+    updateDropTarget(ev);
+  }
+  function up() {
+    window.removeEventListener('pointermove', move);
+    window.removeEventListener('pointerup', up);
+    document.body.classList.remove('dragging');
+    if (ghost) ghost.remove();
+    clearDropZones();
+    if (dragging && currentDrop) performDrop(leaf, currentDrop.targetId, currentDrop.zone);
+    currentDrop = null;
+  }
+  window.addEventListener('pointermove', move);
+  window.addEventListener('pointerup', up);
+}
+
+function updateDropTarget(ev) {
+  const el = document.elementFromPoint(ev.clientX, ev.clientY);
+  const pane = el && el.closest ? el.closest('.pane') : null;
+  if (!pane) { clearDropZones(); currentDrop = null; return; }
+  const rect = pane.getBoundingClientRect();
+  const zone = computeZone(ev.clientX, ev.clientY, rect);
+  showDropZones(rect, zone);
+  currentDrop = { targetId: pane.dataset.id, zone };
+}
+
+function computeZone(x, y, rect) {
+  const fx = (x - rect.left) / rect.width;
+  const fy = (y - rect.top) / rect.height;
+  const edge = 0.30;
+  if (fx > edge && fx < 1 - edge && fy > edge && fy < 1 - edge) return 'center';
+  const dl = fx, dr = 1 - fx, dt = fy, db = 1 - fy;
+  const m = Math.min(dl, dr, dt, db);
+  if (m === dl) return 'left';
+  if (m === dr) return 'right';
+  if (m === dt) return 'top';
+  return 'bottom';
+}
+
+function showDropZones(rect, activeZone) {
+  clearDropZones();
+  zonesEl = document.createElement('div');
+  zonesEl.className = 'drop-zones';
+  zonesEl.style.left = rect.left + 'px';
+  zonesEl.style.top = rect.top + 'px';
+  zonesEl.style.width = rect.width + 'px';
+  zonesEl.style.height = rect.height + 'px';
+  const defs = {
+    left:   { l: '0',   t: '0',   w: '40%',  h: '100%' },
+    right:  { l: '60%', t: '0',   w: '40%',  h: '100%' },
+    top:    { l: '0',   t: '0',   w: '100%', h: '40%' },
+    bottom: { l: '0',   t: '60%', w: '100%', h: '40%' },
+    center: { l: '30%', t: '30%', w: '40%',  h: '40%' },
+  };
+  for (const [zone, d] of Object.entries(defs)) {
+    const z = document.createElement('div');
+    z.className = 'drop-zone' + (zone === activeZone ? ' active' : '');
+    z.style.left = d.l; z.style.top = d.t; z.style.width = d.w; z.style.height = d.h;
+    zonesEl.appendChild(z);
+  }
+  overlay.appendChild(zonesEl);
+}
+
+function clearDropZones() {
+  if (zonesEl) { zonesEl.remove(); zonesEl = null; }
+}
+
+function performDrop(dragged, targetId, zone) {
+  const target = findLeaf(targetId);
+  if (!target || target === dragged) { render(); return; }
+  if (zone === 'center') {
+    swapNodes(dragged, target);
+  } else {
+    removeLeaf(dragged);
+    splitTarget(target, dragged, zone);
+  }
+  focusedId = dragged.id;
+  render();
+}
+
+// ---------------- launcher creation modal ----------------
+
+function openLauncherModal() {
+  const backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  modal.innerHTML = `
+    <h3>Νέο κουμπί εντολής</h3>
+    <label>Όνομα<input type="text" class="m-name" placeholder="π.χ. Project / Build" spellcheck="false"></label>
+    <label>Διαδρομή (προαιρετική)
+      <span class="m-row">
+        <input type="text" class="m-cwd" placeholder="C:\\..." spellcheck="false">
+        <button type="button" class="m-pick" title="Επιλογή φακέλου">📁</button>
+      </span>
+    </label>
+    <label>Εντολή (προαιρετική)<input type="text" class="m-cmd" placeholder="π.χ. npm run dev" spellcheck="false"></label>
+    <label class="m-color-row">Χρώμα<input type="color" class="m-color" value="#58a6ff"></label>
+    <div class="m-hint">Άφησε την εντολή κενή για κουμπί μόνο-διαδρομής (κάνει <code>cd</code>).</div>
+    <div class="m-actions">
+      <button type="button" class="m-cancel">Άκυρο</button>
+      <button type="button" class="m-save">Αποθήκευση</button>
+    </div>
+  `;
+
+  backdrop.appendChild(modal);
+  document.body.appendChild(backdrop);
+
+  const nameI = modal.querySelector('.m-name');
+  const cwdI = modal.querySelector('.m-cwd');
+  const cmdI = modal.querySelector('.m-cmd');
+  const colorI = modal.querySelector('.m-color');
+  nameI.focus();
+
+  function close() { backdrop.remove(); }
+
+  modal.querySelector('.m-pick').addEventListener('click', async () => {
+    const p = await window.termi.pickFolder(cwdI.value || null);
+    if (p) cwdI.value = p;
+  });
+  modal.querySelector('.m-cancel').addEventListener('click', close);
+  backdrop.addEventListener('click', (e) => { if (e.target === backdrop) close(); });
+  window.addEventListener('keydown', function esc(e) {
+    if (e.key === 'Escape') { close(); window.removeEventListener('keydown', esc); }
+  });
+
+  function save() {
+    const name = nameI.value.trim();
+    const cwd = cwdI.value.trim();
+    const command = cmdI.value.trim();
+    if (!name) { nameI.focus(); return; }
+    if (!cwd && !command) { cwdI.focus(); return; }
+    launchers.push({ id: 'l' + Date.now(), name, cwd, command, color: colorI.value });
+    saveLaunchers();
+    close();
+    render();
+  }
+  modal.querySelector('.m-save').addEventListener('click', save);
+  modal.addEventListener('keydown', (e) => { if (e.key === 'Enter') save(); });
+}
+
+// ---------------- file explorer sidebar ----------------
+
+const sidebarEl = document.getElementById('sidebar');
+const treeEl = document.getElementById('tree');
+let rootPath = localStorage.getItem('termi.root') || null;
+const expandedDirs = new Set();
+let currentDir = rootPath; // target dir for new file/folder
+
+// Per-folder name color (path -> hex). Persisted.
+let folderColors = (() => {
+  try { return JSON.parse(localStorage.getItem('termi.folderColors') || '{}'); }
+  catch { return {}; }
+})();
+function saveFolderColors() { localStorage.setItem('termi.folderColors', JSON.stringify(folderColors)); }
+
+// Per-item notes (path -> text). Persisted. Works for both files and folders.
+let notesData = (() => {
+  try { return JSON.parse(localStorage.getItem('termi.notes') || '{}'); }
+  catch { return {}; }
+})();
+function saveNotes() { localStorage.setItem('termi.notes', JSON.stringify(notesData)); }
+function remapNotes(oldP, newP) {
+  const sep = oldP.includes('\\') ? '\\' : '/';
+  const next = {};
+  let changed = false;
+  for (const [p, t] of Object.entries(notesData)) {
+    if (p === oldP || p.startsWith(oldP + sep)) { next[newP + p.slice(oldP.length)] = t; changed = true; }
+    else next[p] = t;
+  }
+  if (changed) { notesData = next; saveNotes(); }
+}
+// Drop notes + color for a deleted path and all its descendants.
+function purgePathData(p) {
+  const sep = p.includes('\\') ? '\\' : '/';
+  let dirty = false;
+  for (const store of [notesData, folderColors]) {
+    for (const k of Object.keys(store)) {
+      if (k === p || k.startsWith(p + sep)) { delete store[k]; dirty = true; }
+    }
+  }
+  if (dirty) { saveNotes(); saveFolderColors(); }
+}
+// First few non-empty lines of a note, for the hover tooltip.
+function notePreview(text, maxLines = 3) {
+  const lines = (text || '').split('\n').map((l) => l.trim()).filter(Boolean);
+  const head = lines.slice(0, maxLines).join('\n');
+  return lines.length > maxLines ? head + '\n…' : head;
+}
+
+let noteTipEl = null;
+function showNoteTip(row, text) {
+  if (!text) return;
+  hideNoteTip();
+  noteTipEl = document.createElement('div');
+  noteTipEl.className = 'note-tip';
+  noteTipEl.textContent = text;
+  document.body.appendChild(noteTipEl);
+  const r = row.getBoundingClientRect();
+  // place to the right of the row, clamped to the viewport
+  let left = r.right + 8;
+  let top = r.top;
+  const tw = noteTipEl.offsetWidth, th = noteTipEl.offsetHeight;
+  if (left + tw > window.innerWidth - 8) left = Math.max(8, r.left - tw - 8);
+  if (top + th > window.innerHeight - 8) top = Math.max(8, window.innerHeight - th - 8);
+  noteTipEl.style.left = left + 'px';
+  noteTipEl.style.top = top + 'px';
+}
+function hideNoteTip() { if (noteTipEl) { noteTipEl.remove(); noteTipEl = null; } }
+// When a folder is moved/renamed, carry its color (and its descendants') to the new path.
+function remapColors(oldP, newP) {
+  const sep = oldP.includes('\\') ? '\\' : '/';
+  const next = {};
+  let changed = false;
+  for (const [p, c] of Object.entries(folderColors)) {
+    if (p === oldP || p.startsWith(oldP + sep)) { next[newP + p.slice(oldP.length)] = c; changed = true; }
+    else next[p] = c;
+  }
+  if (changed) { folderColors = next; saveFolderColors(); }
+}
+
+let activeSidebarView = 'explorer';
+const explorerViewEl = document.getElementById('explorer-view');
+const scmViewEl = document.getElementById('scm-view');
+
+function setSidebarView(v) {
+  activeSidebarView = v;
+  explorerViewEl.classList.toggle('hidden', v !== 'explorer');
+  scmViewEl.classList.toggle('hidden', v !== 'scm');
+  if (v === 'scm') refreshScm();
+}
+function showSidebarView(v) {
+  sidebarEl.classList.remove('hidden');
+  setSidebarView(v);
+  visibleLeafIds().forEach(scheduleFit);
+}
+function toggleSidebarView(v) {
+  if (sidebarEl.classList.contains('hidden') || activeSidebarView !== v) showSidebarView(v);
+  else { sidebarEl.classList.add('hidden'); visibleLeafIds().forEach(scheduleFit); }
+}
+
+async function pickRoot() {
+  const p = await window.termi.pickFolder(rootPath);
+  if (!p) return;
+  rootPath = p;
+  currentDir = p;
+  localStorage.setItem('termi.root', p);
+  expandedDirs.clear();
+  sidebarEl.classList.remove('hidden');
+  window.termi.watchDir(p);
+  await renderTree();
+  updateScmBadge();
+  if (activeSidebarView === 'scm') refreshScm();
+  visibleLeafIds().forEach(scheduleFit);
+}
+
+async function renderTree() {
+  const prevScroll = treeEl.scrollTop;
+  // Build the whole tree off-DOM, then swap it in atomically. Mutating treeEl
+  // directly (empty + async re-append) made it visibly flicker/shake on refresh.
+  const frag = document.createDocumentFragment();
+  if (!rootPath) {
+    const empty = document.createElement('div');
+    empty.className = 'tree-empty';
+    empty.textContent = 'Άνοιξε έναν φάκελο για να ξεκινήσεις.';
+    frag.appendChild(empty);
+    treeEl.replaceChildren(frag);
+    return;
+  }
+  const name = document.createElement('div');
+  name.className = 'tree-root-name';
+  name.textContent = rootPath;
+  name.title = rootPath;
+  name.addEventListener('click', () => { currentDir = rootPath; highlightCurrentDir(); });
+  name.addEventListener('dragover', (e) => {
+    if (!draggedPaths.length || !draggedPaths.some((p) => canDrop(p, rootPath))) return;
+    e.preventDefault(); e.stopPropagation();
+    e.dataTransfer.dropEffect = 'move';
+    setDropTarget(name);
+  });
+  name.addEventListener('drop', (e) => {
+    e.preventDefault(); e.stopPropagation();
+    moveItems(draggedPaths, rootPath);
+  });
+  frag.appendChild(name);
+  await renderChildren(frag, rootPath, 0);
+  treeEl.replaceChildren(frag); // single atomic swap — no empty intermediate state
+  highlightCurrentDir();
+  updateSelectionClasses();
+  treeEl.scrollTop = prevScroll; // keep scroll position stable across rebuilds
+}
+
+async function renderChildren(container, dir, depth) {
+  const entries = await window.termi.listDir(dir);
+  for (const ent of entries) container.appendChild(await makeTreeRow(ent, depth));
+}
+
+async function makeTreeRow(ent, depth) {
+  const wrap = document.createElement('div');
+  const row = document.createElement('div');
+  row.className = 'tree-row ' + (ent.isDir ? 'is-dir' : 'is-file');
+  row.dataset.path = ent.path;
+  row.style.paddingLeft = (depth * 14 + 6) + 'px';
+
+  const label = document.createElement('span');
+  label.className = 'tree-label';
+  label.textContent = ent.name;
+  if (ent.isDir && folderColors[ent.path]) label.style.color = folderColors[ent.path];
+
+  // Notes: dot indicator + brief hover tooltip (first 2-3 lines).
+  if (notesData[ent.path]) {
+    row.classList.add('has-note');
+    row.addEventListener('mouseenter', () => showNoteTip(row, notePreview(notesData[ent.path])));
+    row.addEventListener('mouseleave', hideNoteTip);
+  }
+
+  function plainSelect() {
+    selectedPaths.clear();
+    selectedPaths.add(ent.path);
+    lastClickedPath = ent.path;
+    updateSelectionClasses();
+  }
+
+  row.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    if (!selectedPaths.has(ent.path)) plainSelect();
+    openTreeContextMenu(e, ent);
+  });
+
+  // --- drag & drop to move (supports multi-selection) ---
+  row.draggable = true;
+  row.addEventListener('dragstart', (e) => {
+    if (!selectedPaths.has(ent.path)) plainSelect();
+    draggedPaths = [...selectedPaths];
+    draggedPath = ent.path;
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', ent.path);
+    row.classList.add('dragging');
+  });
+  row.addEventListener('dragend', () => {
+    row.classList.remove('dragging');
+    clearDropTarget();
+    draggedPaths = []; draggedPath = null;
+  });
+  const destFor = () => (ent.isDir ? ent.path : parentDir(ent.path));
+  row.addEventListener('dragover', (e) => {
+    const dest = destFor();
+    if (!draggedPaths.length || !draggedPaths.some((p) => canDrop(p, dest))) return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = 'move';
+    setDropTarget(row);
+  });
+  row.addEventListener('drop', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    moveItems(draggedPaths, destFor());
+  });
+
+  let defaultAction = null;
+
+  if (ent.isDir) {
+    const isOpen = expandedDirs.has(ent.path);
+    const twisty = makeIcon(isOpen ? 'codicon-chevron-down' : 'codicon-chevron-right');
+    twisty.classList.add('tree-twisty');
+    row.append(twisty, label);
+    wrap.appendChild(row);
+
+    const kids = document.createElement('div');
+    kids.className = 'tree-kids';
+    kids.style.display = isOpen ? 'block' : 'none';
+    wrap.appendChild(kids);
+    if (isOpen) { kids.dataset.loaded = '1'; await renderChildren(kids, ent.path, depth + 1); }
+
+    defaultAction = async () => {
+      currentDir = ent.path;
+      if (expandedDirs.has(ent.path)) {
+        expandedDirs.delete(ent.path);
+        kids.style.display = 'none';
+        twisty.className = 'codicon codicon-chevron-right tree-twisty';
+      } else {
+        expandedDirs.add(ent.path);
+        twisty.className = 'codicon codicon-chevron-down tree-twisty';
+        kids.style.display = 'block';
+        if (!kids.dataset.loaded) { kids.dataset.loaded = '1'; await renderChildren(kids, ent.path, depth + 1); }
+      }
+      highlightCurrentDir();
+    };
+  } else {
+    const spacer = makeIcon('codicon-blank');
+    spacer.classList.add('tree-twisty');
+    const ficon = makeIcon(fileIconClass(ent.name));
+    ficon.classList.add('tree-ficon');
+    row.append(spacer, ficon, label);
+    wrap.appendChild(row);
+
+    defaultAction = () => { currentDir = parentDir(ent.path); highlightCurrentDir(); openFile(ent.path); };
+  }
+
+  row.addEventListener('click', (e) => {
+    if (e.ctrlKey || e.metaKey) {
+      if (selectedPaths.has(ent.path)) selectedPaths.delete(ent.path);
+      else selectedPaths.add(ent.path);
+      lastClickedPath = ent.path;
+      updateSelectionClasses();
+      return; // selection only, no expand/open
+    }
+    if (e.shiftKey && lastClickedPath) {
+      selectRange(lastClickedPath, ent.path);
+      updateSelectionClasses();
+      return;
+    }
+    plainSelect();
+    if (defaultAction) defaultAction();
+  });
+
+  return wrap;
+}
+
+function parentDir(p) { return p.replace(/[\\/][^\\/]*$/, ''); }
+function joinPath(dir, name) { return dir + (dir.includes('\\') ? '\\' : '/') + name; }
+// Quote a path for the shell prompt only when it needs it (spaces/special chars).
+function quoteForShell(p) { return /[\s'"&()$`;,]/.test(p) ? `"${p.replace(/"/g, '`"')}"` : p; }
+
+const FILE_ICONS = {
+  js: 'file-code', mjs: 'file-code', cjs: 'file-code', jsx: 'file-code',
+  ts: 'file-code', tsx: 'file-code', html: 'file-code', htm: 'file-code',
+  css: 'file-code', scss: 'file-code', less: 'file-code', py: 'file-code',
+  java: 'file-code', c: 'file-code', h: 'file-code', cpp: 'file-code',
+  cs: 'file-code', go: 'file-code', rs: 'file-code', rb: 'file-code',
+  php: 'file-code', vue: 'file-code', svelte: 'file-code',
+  json: 'json', md: 'markdown', markdown: 'markdown',
+  csv: 'table', txt: 'file-text', log: 'output',
+  sh: 'terminal', bash: 'terminal', ps1: 'terminal', bat: 'terminal', cmd: 'terminal',
+  png: 'file-media', jpg: 'file-media', jpeg: 'file-media', gif: 'file-media',
+  svg: 'file-media', webp: 'file-media', ico: 'file-media', mp4: 'file-media', mp3: 'file-media',
+  zip: 'file-zip', rar: 'file-zip', '7z': 'file-zip', gz: 'file-zip', tar: 'file-zip',
+  pdf: 'file-pdf',
+  yml: 'settings-gear', yaml: 'settings-gear', toml: 'settings-gear',
+  ini: 'settings-gear', env: 'settings-gear', conf: 'settings-gear',
+  sql: 'database', db: 'database', sqlite: 'database',
+};
+function fileIconClass(name) { return 'codicon-' + (FILE_ICONS[extOf(name)] || 'file'); }
+
+function makeIcon(cls) {
+  const i = document.createElement('i');
+  i.className = 'codicon ' + cls;
+  return i;
+}
+
+function highlightCurrentDir() {
+  treeEl.querySelectorAll('.curdir').forEach((r) => r.classList.remove('curdir'));
+  if (!currentDir) return;
+  if (currentDir === rootPath) {
+    const rn = treeEl.querySelector('.tree-root-name');
+    if (rn) rn.classList.add('curdir');
+  }
+  treeEl.querySelectorAll('.tree-row').forEach((r) => { if (r.dataset.path === currentDir) r.classList.add('curdir'); });
+}
+
+// ---- file operations ----
+
+async function newFileFlow() {
+  const dir = currentDir || rootPath;
+  if (!dir) return;
+  const nm = await promptModal('Νέο αρχείο', 'untitled.txt');
+  if (!nm) return;
+  const res = await window.termi.createFile(dir, nm);
+  if (!res.ok) { alertModal('Σφάλμα', res.error); return; }
+  expandedDirs.add(dir);
+  await renderTree();
+  openFile(joinPath(dir, nm));
+}
+
+async function newFolderFlow() {
+  const dir = currentDir || rootPath;
+  if (!dir) return;
+  const nm = await promptModal('Νέος φάκελος', 'new-folder');
+  if (!nm) return;
+  const res = await window.termi.mkdir(dir, nm);
+  if (!res.ok) { alertModal('Σφάλμα', res.error); return; }
+  expandedDirs.add(dir);
+  await renderTree();
+}
+
+async function renameFlow(ent) {
+  const nm = await promptModal('Μετονομασία', ent.name);
+  if (!nm || nm === ent.name) return;
+  const res = await window.termi.renamePath(ent.path, nm);
+  if (!res.ok) { alertModal('Σφάλμα', res.error); return; }
+  const newPath = joinPath(parentDir(ent.path), nm);
+  remapColors(ent.path, newPath);
+  remapNotes(ent.path, newPath);
+  for (const [id, v] of views) {
+    if (v.kind === 'editor' && v.filePath === ent.path) {
+      v.filePath = newPath;
+      const lf = findLeaf(id);
+      if (lf) { lf.filePath = newPath; lf.name = basename(newPath); }
+    }
+  }
+  await renderTree();
+  render();
+}
+
+async function colorFlow(ent) {
+  const chosen = await colorModal(folderColors[ent.path] || '');
+  if (chosen === undefined) return; // cancelled
+  if (chosen === null) delete folderColors[ent.path]; // reset to default
+  else folderColors[ent.path] = chosen;
+  saveFolderColors();
+  await renderTree();
+}
+
+async function notesFlow(ent) {
+  const result = await notesModal(ent.name, notesData[ent.path] || '');
+  if (result === undefined) return; // cancelled
+  if (result.trim()) notesData[ent.path] = result;
+  else delete notesData[ent.path];
+  saveNotes();
+  await renderTree();
+}
+
+async function deleteFlow(ent) {
+  const ok = await confirmModal('Διαγραφή', `Να διαγραφεί οριστικά "${ent.name}";`);
+  if (!ok) return;
+  const res = await window.termi.deletePath(ent.path);
+  if (!res.ok) { alertModal('Σφάλμα', res.error); return; }
+  expandedDirs.delete(ent.path);
+  purgePathData(ent.path);
+  await renderTree();
+}
+
+// ---- tree selection + drag & drop (move items) ----
+
+let draggedPath = null;
+let draggedPaths = [];
+let dropTargetEl = null;
+const selectedPaths = new Set();
+let lastClickedPath = null;
+
+function updateSelectionClasses() {
+  treeEl.querySelectorAll('.tree-row').forEach((r) => {
+    r.classList.toggle('selected', selectedPaths.has(r.dataset.path));
+  });
+}
+
+function selectRange(fromPath, toPath) {
+  const rows = [...treeEl.querySelectorAll('.tree-row')].map((r) => r.dataset.path);
+  let i = rows.indexOf(fromPath), j = rows.indexOf(toPath);
+  if (i < 0 || j < 0) { selectedPaths.add(toPath); return; }
+  if (i > j) [i, j] = [j, i];
+  selectedPaths.clear();
+  for (let k = i; k <= j; k++) selectedPaths.add(rows[k]);
+}
+
+function canDrop(src, dest) {
+  if (!src || !dest) return false;
+  if (dest === src) return false;
+  if (parentDir(src) === dest) return false;        // already in this folder
+  const sep = src.includes('\\') ? '\\' : '/';
+  if (dest === src || dest.startsWith(src + sep)) return false; // into itself/descendant
+  return true;
+}
+
+function setDropTarget(el) {
+  if (dropTargetEl === el) return;
+  clearDropTarget();
+  dropTargetEl = el;
+  if (el) el.classList.add('drop-target');
+}
+function clearDropTarget() {
+  if (dropTargetEl) dropTargetEl.classList.remove('drop-target');
+  dropTargetEl = null;
+}
+
+function remapEditors(oldP, newP) {
+  const sep = oldP.includes('\\') ? '\\' : '/';
+  for (const [id, v] of views) {
+    if (v.kind !== 'editor') continue;
+    let np = null;
+    if (v.filePath === oldP) np = newP;
+    else if (v.filePath.startsWith(oldP + sep)) np = newP + v.filePath.slice(oldP.length);
+    if (np) {
+      v.filePath = np;
+      const lf = findLeaf(id);
+      if (lf) { lf.filePath = np; lf.name = basename(np); }
+    }
+  }
+}
+
+function remapExpanded(oldP, newP) {
+  const sep = oldP.includes('\\') ? '\\' : '/';
+  for (const p of [...expandedDirs]) {
+    if (p === oldP || p.startsWith(oldP + sep)) {
+      expandedDirs.delete(p);
+      expandedDirs.add(newP + p.slice(oldP.length));
+    }
+  }
+}
+
+async function moveItems(paths, dest) {
+  clearDropTarget();
+  const movable = (paths || []).filter((p) => canDrop(p, dest));
+  if (!movable.length) return;
+  let firstErr = null;
+  for (const src of movable) {
+    const res = await window.termi.movePath(src, dest);
+    if (!res.ok) { firstErr = firstErr || res.error; continue; }
+    const newPath = joinPath(dest, basename(src));
+    remapEditors(src, newPath);
+    remapExpanded(src, newPath);
+    remapColors(src, newPath);
+    remapNotes(src, newPath);
+  }
+  expandedDirs.add(dest);
+  selectedPaths.clear();
+  draggedPaths = []; draggedPath = null;
+  if (firstErr) alertModal('Σφάλμα μετακίνησης', firstErr);
+  await renderTree();
+  render();
+}
+
+async function deleteSelected() {
+  const paths = [...selectedPaths];
+  if (!paths.length) return;
+  const ok = await confirmModal(
+    'Διαγραφή',
+    paths.length === 1 ? `Να διαγραφεί οριστικά "${basename(paths[0])}";`
+      : `Να διαγραφούν οριστικά ${paths.length} στοιχεία;`
+  );
+  if (!ok) return;
+  let firstErr = null;
+  for (const p of paths) {
+    const res = await window.termi.deletePath(p);
+    if (!res.ok) { firstErr = firstErr || res.error; continue; }
+    expandedDirs.delete(p);
+    purgePathData(p);
+  }
+  selectedPaths.clear();
+  if (firstErr) alertModal('Σφάλμα διαγραφής', firstErr);
+  await renderTree();
+}
+
+// ---- tree context menu ----
+
+let ctxMenuEl = null;
+function closeContextMenu() { if (ctxMenuEl) { ctxMenuEl.remove(); ctxMenuEl = null; } }
+
+function openTreeContextMenu(e, ent) {
+  closeContextMenu();
+  const menu = document.createElement('div');
+  menu.className = 'ctx-menu';
+  menu.style.left = e.clientX + 'px';
+  menu.style.top = e.clientY + 'px';
+
+  const multi = selectedPaths.size > 1;
+  const items = [];
+  if (!multi) {
+    if (ent.isDir) {
+      items.push(['📄 Νέο αρχείο', () => { currentDir = ent.path; expandedDirs.add(ent.path); newFileFlow(); }]);
+      items.push(['📁 Νέος φάκελος', () => { currentDir = ent.path; expandedDirs.add(ent.path); newFolderFlow(); }]);
+      items.push(['🎨 Χρώμα ονόματος', () => colorFlow(ent)]);
+    } else {
+      items.push(['↗ Άνοιγμα', () => openFile(ent.path)]);
+    }
+    items.push(['✎ Μετονομασία', () => renameFlow(ent)]);
+    items.push([notesData[ent.path] ? '📝 Σημειώσεις •' : '📝 Σημειώσεις', () => notesFlow(ent)]);
+  }
+  items.push([multi ? `🗑 Διαγραφή (${selectedPaths.size})` : '🗑 Διαγραφή', () => deleteSelected()]);
+
+  for (const [lbl, fn] of items) {
+    const it = document.createElement('div');
+    it.className = 'ctx-item';
+    it.textContent = lbl;
+    it.addEventListener('click', () => { closeContextMenu(); fn(); });
+    menu.appendChild(it);
+  }
+  document.body.appendChild(menu);
+  setTimeout(() => document.addEventListener('pointerdown', function onDown(ev) {
+    if (!menu.contains(ev.target)) closeContextMenu();
+    else document.addEventListener('pointerdown', onDown, { once: true });
+  }, { once: true }), 0);
+  ctxMenuEl = menu;
+}
+
+// ---- generic modals ----
+
+function promptModal(title, def) {
+  return new Promise((resolve) => {
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    const modal = document.createElement('div');
+    modal.className = 'modal modal-sm';
+    modal.innerHTML = `<h3>${escapeHtml(title)}</h3>
+      <input type="text" class="p-input" spellcheck="false">
+      <div class="m-actions"><button class="m-cancel">Άκυρο</button><button class="m-save">OK</button></div>`;
+    backdrop.appendChild(modal);
+    document.body.appendChild(backdrop);
+    const input = modal.querySelector('.p-input');
+    input.value = def || '';
+    input.focus(); input.select();
+    function done(val) { backdrop.remove(); resolve(val); }
+    modal.querySelector('.m-cancel').addEventListener('click', () => done(null));
+    modal.querySelector('.m-save').addEventListener('click', () => done(input.value.trim() || null));
+    backdrop.addEventListener('click', (e) => { if (e.target === backdrop) done(null); });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') done(input.value.trim() || null);
+      if (e.key === 'Escape') done(null);
+    });
+  });
+}
+
+function confirmModal(title, msg) {
+  return new Promise((resolve) => {
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    const modal = document.createElement('div');
+    modal.className = 'modal modal-sm';
+    modal.innerHTML = `<h3>${escapeHtml(title)}</h3><div class="m-hint">${escapeHtml(msg)}</div>
+      <div class="m-actions"><button class="m-cancel">Άκυρο</button><button class="m-save m-danger">Διαγραφή</button></div>`;
+    backdrop.appendChild(modal);
+    document.body.appendChild(backdrop);
+    function done(v) { backdrop.remove(); resolve(v); }
+    modal.querySelector('.m-cancel').addEventListener('click', () => done(false));
+    modal.querySelector('.m-save').addEventListener('click', () => done(true));
+    backdrop.addEventListener('click', (e) => { if (e.target === backdrop) done(false); });
+  });
+}
+
+// Returns: a hex string (chosen), null (reset to default), or undefined (cancelled).
+const FOLDER_SWATCHES = [
+  '#58a6ff', '#3fb950', '#d29922', '#ff7b72', '#bc8cff',
+  '#39c5cf', '#f778ba', '#ffa657', '#a5d6ff', '#7ee787',
+];
+function colorModal(current) {
+  return new Promise((resolve) => {
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    const modal = document.createElement('div');
+    modal.className = 'modal modal-sm';
+    const swatches = FOLDER_SWATCHES.map((c) =>
+      `<button class="sw" data-c="${c}" style="background:${c}" title="${c}"></button>`).join('');
+    modal.innerHTML = `<h3>Χρώμα ονόματος φακέλου</h3>
+      <div class="sw-grid">${swatches}</div>
+      <div class="sw-custom">
+        <label>Προσαρμοσμένο <input type="color" class="sw-pick" value="${/^#[0-9a-f]{6}$/i.test(current) ? current : '#58a6ff'}"></label>
+      </div>
+      <div class="m-actions">
+        <button class="m-cancel">Άκυρο</button>
+        <button class="m-reset">Επαναφορά</button>
+        <button class="m-save sw-use">Χρήση</button>
+      </div>`;
+    backdrop.appendChild(modal);
+    document.body.appendChild(backdrop);
+    const pick = modal.querySelector('.sw-pick');
+    function done(v) { backdrop.remove(); resolve(v); }
+    modal.querySelectorAll('.sw').forEach((b) =>
+      b.addEventListener('click', () => done(b.dataset.c)));
+    modal.querySelector('.sw-use').addEventListener('click', () => done(pick.value));
+    modal.querySelector('.m-reset').addEventListener('click', () => done(null));
+    modal.querySelector('.m-cancel').addEventListener('click', () => done(undefined));
+    backdrop.addEventListener('click', (e) => { if (e.target === backdrop) done(undefined); });
+  });
+}
+
+// Plain-text notes editor. Returns the text on save, or undefined if cancelled.
+function notesModal(name, current) {
+  return new Promise((resolve) => {
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    const modal = document.createElement('div');
+    modal.className = 'modal modal-notes';
+    modal.innerHTML = `<h3>📝 Σημειώσεις — ${escapeHtml(name)}</h3>
+      <textarea class="notes-input" spellcheck="false" placeholder="Γράψε σημειώσεις, περιγραφή, TODO…"></textarea>
+      <div class="m-hint">Οι 2-3 πρώτες γραμμές εμφανίζονται στο hover. Ctrl+Enter για αποθήκευση.</div>
+      <div class="m-actions"><button class="m-cancel">Άκυρο</button><button class="m-save">Αποθήκευση</button></div>`;
+    backdrop.appendChild(modal);
+    document.body.appendChild(backdrop);
+    const ta = modal.querySelector('.notes-input');
+    ta.value = current || '';
+    ta.focus();
+    function done(v) { backdrop.remove(); resolve(v); }
+    modal.querySelector('.m-cancel').addEventListener('click', () => done(undefined));
+    modal.querySelector('.m-save').addEventListener('click', () => done(ta.value));
+    backdrop.addEventListener('click', (e) => { if (e.target === backdrop) done(undefined); });
+    ta.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); done(ta.value); }
+      if (e.key === 'Escape') done(undefined);
+    });
+  });
+}
+
+// Index popup: lists every item that has notes; click to open its note.
+function openNotesIndex() {
+  const entries = Object.entries(notesData).filter(([, t]) => t && t.trim());
+  const backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+  const modal = document.createElement('div');
+  modal.className = 'modal modal-notes';
+  function close() { backdrop.remove(); }
+  if (!entries.length) {
+    modal.innerHTML = `<h3>📝 Σημειώσεις</h3>
+      <div class="m-hint">Δεν υπάρχουν σημειώσεις ακόμη. Δεξί κλικ σε αρχείο/φάκελο → «Σημειώσεις».</div>
+      <div class="m-actions"><button class="m-save">OK</button></div>`;
+    backdrop.appendChild(modal);
+    document.body.appendChild(backdrop);
+    modal.querySelector('.m-save').addEventListener('click', close);
+    backdrop.addEventListener('click', (e) => { if (e.target === backdrop) close(); });
+    return;
+  }
+  entries.sort((a, b) => basename(a[0]).localeCompare(basename(b[0])));
+  const rows = entries.map(([p, t]) => `
+    <div class="note-row" data-path="${escapeHtml(p)}">
+      <div class="note-row-name">${escapeHtml(basename(p))}</div>
+      <div class="note-row-prev">${escapeHtml(notePreview(t, 2))}</div>
+    </div>`).join('');
+  modal.innerHTML = `<h3>📝 Σημειώσεις (${entries.length})</h3>
+    <div class="notes-list">${rows}</div>
+    <div class="m-actions"><button class="m-save">Κλείσιμο</button></div>`;
+  backdrop.appendChild(modal);
+  document.body.appendChild(backdrop);
+  modal.querySelector('.m-save').addEventListener('click', close);
+  backdrop.addEventListener('click', (e) => { if (e.target === backdrop) close(); });
+  modal.querySelectorAll('.note-row').forEach((r) => {
+    r.addEventListener('click', async () => {
+      const p = r.dataset.path;
+      close();
+      await revealAndEditNote(p);
+    });
+  });
+}
+
+// Reveal an item in the tree (expand ancestors), then open its note editor.
+async function revealAndEditNote(p) {
+  if (rootPath) {
+    const sep = rootPath.includes('\\') ? '\\' : '/';
+    if (p.startsWith(rootPath + sep)) {
+      const rel = p.slice(rootPath.length + 1).split(sep);
+      let acc = rootPath;
+      for (let i = 0; i < rel.length - 1; i++) { acc = acc + sep + rel[i]; expandedDirs.add(acc); }
+      await renderTree();
+      const row = treeEl.querySelector(`.tree-row[data-path="${cssEscape(p)}"]`);
+      if (row) row.scrollIntoView({ block: 'center' });
+    }
+  }
+  await notesFlow({ name: basename(p), path: p });
+}
+function cssEscape(s) { return s.replace(/["\\]/g, '\\$&'); }
+
+function alertModal(title, msg) {
+  const backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+  const modal = document.createElement('div');
+  modal.className = 'modal modal-sm';
+  modal.innerHTML = `<h3>${escapeHtml(title)}</h3><div class="m-hint">${escapeHtml(msg || '')}</div>
+    <div class="m-actions"><button class="m-save">OK</button></div>`;
+  backdrop.appendChild(modal);
+  document.body.appendChild(backdrop);
+  modal.querySelector('.m-save').addEventListener('click', () => backdrop.remove());
+  backdrop.addEventListener('click', (e) => { if (e.target === backdrop) backdrop.remove(); });
+}
+
+// ---------------- source control (git) ----------------
+
+const GIT_SYM = {
+  M: { letter: 'M', cls: 'modified', title: 'Modified' },
+  A: { letter: 'A', cls: 'added', title: 'Added' },
+  D: { letter: 'D', cls: 'deleted', title: 'Deleted' },
+  R: { letter: 'R', cls: 'renamed', title: 'Renamed' },
+  C: { letter: 'C', cls: 'conflict', title: 'Conflict' },
+  U: { letter: 'C', cls: 'conflict', title: 'Conflict' },
+};
+function gitSymbol(f) {
+  if (f.index === '?' && f.working_dir === '?') return { letter: 'U', cls: 'untracked', title: 'Untracked' };
+  const c = (f.working_dir && f.working_dir !== ' ' && f.working_dir !== '?') ? f.working_dir : f.index;
+  return GIT_SYM[c] || { letter: c || '•', cls: 'modified', title: 'Changed' };
+}
+
+function setScmBadge(n) {
+  const b = document.getElementById('scmBadge');
+  b.textContent = n > 0 ? String(n) : '';
+  b.style.display = n > 0 ? 'flex' : 'none';
+}
+
+async function updateScmBadge() {
+  if (!rootPath) { setScmBadge(0); return; }
+  const res = await window.termi.gitStatus(rootPath);
+  if (res.ok && res.value.isRepo) setScmBadge((res.value.files || []).length);
+  else setScmBadge(0);
+}
+
+async function refreshScm() {
+  const branchEl = document.getElementById('scm-branch');
+  const changesEl = document.getElementById('scm-changes');
+  const countEl = document.getElementById('scm-count');
+
+  if (!rootPath) {
+    branchEl.textContent = '';
+    changesEl.innerHTML = '<div class="tree-empty">Άνοιξε έναν φάκελο.</div>';
+    countEl.textContent = '0'; setScmBadge(0);
+    return;
+  }
+  const res = await window.termi.gitStatus(rootPath);
+  if (!res.ok) {
+    branchEl.textContent = '';
+    changesEl.innerHTML = '<div class="tree-empty">Σφάλμα git</div>';
+    return;
+  }
+  const st = res.value;
+  if (!st.isRepo) {
+    branchEl.textContent = '';
+    countEl.textContent = '0'; setScmBadge(0);
+    changesEl.innerHTML = '';
+    const msg = document.createElement('div');
+    msg.className = 'tree-empty';
+    msg.textContent = 'Δεν είναι git repository.';
+    const initBtn = document.createElement('button');
+    initBtn.className = 'scm-init';
+    initBtn.textContent = 'Αρχικοποίηση repository';
+    initBtn.addEventListener('click', async () => {
+      const r = await window.termi.gitInit(rootPath);
+      if (!r.ok) { alertModal('Σφάλμα', r.error); return; }
+      refreshScm();
+    });
+    changesEl.append(msg, initBtn);
+    return;
+  }
+
+  branchEl.innerHTML = '<i class="codicon codicon-git-branch"></i> ' + escapeHtml(st.branch || '(no branch)')
+    + (st.ahead ? ` <span class="scm-track">↑${st.ahead}</span>` : '')
+    + (st.behind ? ` <span class="scm-track">↓${st.behind}</span>` : '');
+
+  const files = st.files || [];
+  countEl.textContent = String(files.length);
+  setScmBadge(files.length);
+  changesEl.innerHTML = '';
+  if (!files.length) { changesEl.innerHTML = '<div class="tree-empty">Καμία αλλαγή</div>'; return; }
+
+  for (const f of files) {
+    const sym = gitSymbol(f);
+    const row = document.createElement('div');
+    row.className = 'scm-row';
+    row.title = f.path;
+
+    const ic = document.createElement('i');
+    ic.className = 'codicon ' + (fileIconClass(f.path)) + ' scm-ficon';
+
+    const name = document.createElement('span');
+    name.className = 'scm-name';
+    name.textContent = basename(f.path);
+
+    const dir = document.createElement('span');
+    dir.className = 'scm-dir';
+    dir.textContent = f.path.includes('/') ? f.path.replace(/\/[^/]*$/, '') : '';
+
+    const badge = document.createElement('span');
+    badge.className = 'scm-status scm-' + sym.cls;
+    badge.textContent = sym.letter;
+    badge.title = sym.title;
+
+    row.append(ic, name, dir, badge);
+    const full = (st.root || rootPath) + '/' + f.path;
+    if (sym.letter !== 'D') row.addEventListener('click', () => openFile(full));
+    changesEl.appendChild(row);
+  }
+}
+
+async function doCommit() {
+  if (!rootPath) return;
+  const msgEl = document.getElementById('scm-message');
+  const msg = msgEl.value.trim();
+  if (!msg) { msgEl.focus(); return; }
+  const res = await window.termi.gitCommit(rootPath, msg);
+  if (!res.ok) { alertModal('Σφάλμα commit', res.error); return; }
+  msgEl.value = '';
+  refreshScm();
+}
+
+async function gitPushPull(which) {
+  if (!rootPath) return;
+  const res = which === 'push' ? await window.termi.gitPush(rootPath) : await window.termi.gitPull(rootPath);
+  if (!res.ok) { alertModal('Σφάλμα ' + which, res.error); return; }
+  refreshScm();
+}
+
+// ---------------- bootstrap ----------------
+
+document.getElementById('toggleSidebar').addEventListener('click', () => toggleSidebarView('explorer'));
+document.getElementById('scmBtn').addEventListener('click', () => toggleSidebarView('scm'));
+
+// window controls (frameless)
+document.getElementById('win-full').addEventListener('click', () => window.termi.winFullscreen());
+document.getElementById('win-min').addEventListener('click', () => window.termi.winMinimize());
+document.getElementById('win-max').addEventListener('click', () => window.termi.winMaximize());
+document.getElementById('win-close').addEventListener('click', () => window.termi.winClose());
+window.termi.onMaximizeChange((max) => {
+  const i = document.querySelector('#win-max .codicon');
+  if (i) i.className = 'codicon ' + (max ? 'codicon-chrome-restore' : 'codicon-chrome-maximize');
+});
+window.termi.onFullscreenChange((fs) => {
+  const i = document.querySelector('#win-full .codicon');
+  if (i) i.className = 'codicon ' + (fs ? 'codicon-screen-normal' : 'codicon-screen-full');
+  document.getElementById('win-full').title = fs ? 'Έξοδος πλήρους οθόνης (F11)' : 'Πλήρης οθόνη (F11)';
+});
+document.getElementById('pickRoot').addEventListener('click', pickRoot);
+document.getElementById('newFile').addEventListener('click', newFileFlow);
+document.getElementById('newFolder').addEventListener('click', newFolderFlow);
+document.getElementById('notesIndex').addEventListener('click', openNotesIndex);
+
+// source control wiring
+document.getElementById('scmRefresh').addEventListener('click', refreshScm);
+document.getElementById('scm-commit').addEventListener('click', doCommit);
+document.getElementById('scm-pull').addEventListener('click', () => gitPushPull('pull'));
+document.getElementById('scm-push').addEventListener('click', () => gitPushPull('push'));
+document.getElementById('scm-message').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); doCommit(); }
+});
+if (rootPath) updateScmBadge();
+
+// drop on empty tree area -> move to root
+treeEl.addEventListener('dragover', (e) => {
+  if (!rootPath || !draggedPaths.length || !draggedPaths.some((p) => canDrop(p, rootPath))) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+});
+treeEl.addEventListener('drop', (e) => {
+  if (!rootPath || !draggedPaths.length) return;
+  e.preventDefault();
+  moveItems(draggedPaths, rootPath);
+});
+if (rootPath) { sidebarEl.classList.remove('hidden'); renderTree(); window.termi.watchDir(rootPath); }
+
+// Auto-refresh the tree when files change on disk (e.g. a benchmark writing output).
+let treeRefreshTimer = null, treeRefreshing = false, treeRefreshPending = false;
+async function autoRefreshTree() {
+  if (!rootPath) return;
+  if (treeRefreshing) { treeRefreshPending = true; return; }
+  treeRefreshing = true;
+  try { await renderTree(); } finally { treeRefreshing = false; }
+  if (treeRefreshPending) { treeRefreshPending = false; autoRefreshTree(); }
+}
+window.termi.onFsChange(() => {
+  clearTimeout(treeRefreshTimer);
+  treeRefreshTimer = setTimeout(() => { autoRefreshTree(); refreshOpenEditors(); }, 200);
+  if (rootPath && activeSidebarView === 'scm') updateScmBadge();
+});
+
+// --- sidebar width resize ---
+const sidebarResizer = document.getElementById('sidebar-resizer');
+const savedSidebarW = parseInt(localStorage.getItem('termi.sidebarWidth') || '', 10);
+if (savedSidebarW >= 150 && savedSidebarW <= 640) sidebarEl.style.width = savedSidebarW + 'px';
+sidebarResizer.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  sidebarResizer.setPointerCapture(e.pointerId);
+  sidebarResizer.classList.add('dragging');
+  const startX = e.clientX;
+  const startW = sidebarEl.getBoundingClientRect().width;
+  function move(ev) {
+    const w = Math.max(150, Math.min(640, startW + (ev.clientX - startX)));
+    sidebarEl.style.width = w + 'px';
+  }
+  function up() {
+    sidebarResizer.classList.remove('dragging');
+    localStorage.setItem('termi.sidebarWidth', String(parseInt(sidebarEl.style.width, 10) || 260));
+    window.removeEventListener('pointermove', move);
+    window.removeEventListener('pointerup', up);
+    visibleLeafIds().forEach(scheduleFit);
+  }
+  window.addEventListener('pointermove', move);
+  window.addEventListener('pointerup', up);
+});
+
+document.getElementById('addPane').addEventListener('click', addPane);
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'F11') { e.preventDefault(); window.termi.winFullscreen(); return; }
+  if (e.ctrlKey && e.key.toLowerCase() === 't') { e.preventDefault(); addPane(); return; }
+  // Delete key removes the tree selection (unless typing in an editor/terminal/input)
+  if ((e.key === 'Delete' || e.key === 'Del') && selectedPaths.size) {
+    const ae = document.activeElement;
+    if (ae && (ae.closest('.pane') || ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable)) return;
+    e.preventDefault();
+    deleteSelected();
+  }
+});
+window.addEventListener('resize', () => visibleLeafIds().forEach(scheduleFit));
+
+render();

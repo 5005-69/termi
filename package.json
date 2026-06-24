@@ -1,0 +1,58 @@
+{
+  "name": "termi",
+  "version": "0.1.0",
+  "description": "Custom terminal manager with dynamic split layouts",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "door": "node remote/cli.js",
+    "geticon": "node scripts/generate-icon.js",
+    "dist": "electron-builder --win nsis"
+  },
+  "author": "",
+  "license": "MIT",
+  "build": {
+    "appId": "com.termi.app",
+    "productName": "termi",
+    "npmRebuild": false,
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "asarUnpack": [
+      "node_modules/monaco-editor/**",
+      "node_modules/node-pty/**"
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "termi"
+    }
+  },
+  "devDependencies": {
+    "electron": "^31.0.0",
+    "electron-builder": "^26.15.3",
+    "jimp": "^0.22.12",
+    "png-to-ico": "^3.0.1"
+  },
+  "dependencies": {
+    "@vscode/codicons": "^0.0.45",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "marked": "^18.0.5",
+    "monaco-editor": "^0.45.0",
+    "node-pty": "^1.1.0",
+    "qrcode": "^1.5.4",
+    "simple-git": "^3.36.0",
+    "ws": "^8.21.0"
+  }
+}
