@@ -16,6 +16,7 @@
     <button id="remoteBtn" title="Άνοιγμα από κινητό (QR)"><i class="codicon codicon-radio-tower"></i></button>
     <div class="toolbar-spacer"></div>
     <div class="window-controls">
+      <button id="win-update" class="winbtn winbtn-update hidden" title="Διαθέσιμη ενημέρωση"><i class="codicon codicon-cloud-download"></i></button>
       <button id="win-full" class="winbtn" title="Πλήρης οθόνη (F11)"><i class="codicon codicon-screen-full"></i></button>
       <button id="win-min" class="winbtn" title="Ελαχιστοποίηση"><i class="codicon codicon-chrome-minimize"></i></button>
       <button id="win-max" class="winbtn" title="Μεγιστοποίηση"><i class="codicon codicon-chrome-maximize"></i></button>
@@ -74,6 +75,11 @@
       <div id="remote-idle" class="remote-body">
         <p>Άνοιξε μια ασφαλή «πόρτα»: σκανάρεις το QR από το κινητό και χειρίζεσαι τα terminals από οπουδήποτε (ακόμη κι από άλλο δίκτυο). Οι εντολές τρέχουν εδώ στον υπολογιστή.</p>
         <label class="remote-opt"><input type="checkbox" id="remoteReadOnly" /> Μόνο παρακολούθηση (read-only)</label>
+        <div class="remote-pin-set">
+          <label for="remotePinInput">Κωδικός PIN</label>
+          <input type="text" id="remotePinInput" inputmode="numeric" pattern="[0-9]*" maxlength="8" placeholder="τυχαίο" spellcheck="false" autocomplete="off" />
+          <span class="remote-hint" id="remotePinHint">Άφησέ το κενό για τυχαίο κωδικό κάθε φορά. Αποθηκεύεται για την επόμενη φορά.</span>
+        </div>
         <button id="remoteStart" class="remote-primary">Άνοιγμα πόρτας</button>
         <div class="remote-note">Πρώτη φορά: κατεβαίνει μία φορά το cloudflared (~70MB).</div>
       </div>

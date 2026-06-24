@@ -33,16 +33,20 @@ function userDataDir() {
 const args = process.argv.slice(2);
 const readOnly = args.includes('--read-only') || args.includes('-r');
 
-// Resolve the door PIN WITHOUT baking a personal code into the repo:
-//   1. env TERMI_PIN  2. a local, gitignored remote/.pin file  3. a fresh random PIN.
-// Keep your own fixed code by writing it into remote/.pin (see remote/.pin.example).
+// Resolve the door PIN WITHOUT baking a personal code into the repo, in order:
+//   1. env TERMI_PIN
+//   2. the PIN set from the desktop QR modal (userData/door-pin — shared with the app)
+//   3. a local, gitignored remote/.pin file
+//   4. a fresh random PIN.
+function readPinFile(p) {
+  try { const v = fs.readFileSync(p, 'utf8').trim(); if (v) return v; } catch { /* absent */ }
+  return null;
+}
 function resolvePin() {
   if (process.env.TERMI_PIN) return process.env.TERMI_PIN.trim();
-  try {
-    const fromFile = fs.readFileSync(path.join(__dirname, '.pin'), 'utf8').trim();
-    if (fromFile) return fromFile;
-  } catch { /* no .pin file — fall through to a random code */ }
-  return null; // null => server.open() generates a fresh random PIN
+  return readPinFile(path.join(userDataDir(), 'door-pin'))
+    || readPinFile(path.join(__dirname, '.pin'))
+    || null; // null => server.open() generates a fresh random PIN
 }
 const FIXED_PIN = resolvePin();
 

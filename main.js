@@ -1,9 +1,14 @@
 const { app, BrowserWindow, ipcMain, dialog, Menu, clipboard } = require('electron');
 const path = require('path');
 const os = require('os');
+const fs = require('fs');
 const fsp = require('fs').promises;
+const https = require('https');
 const pty = require('node-pty');
 const simpleGit = require('simple-git');
+
+// GitHub repo used for the in-app updater (owner/name).
+const UPDATE_REPO = '5005-69/termi';
 
 /** @type {Map<string, import('node-pty').IPty>} */
 const ptys = new Map();
@@ -44,6 +49,19 @@ function createWindow() {
 
   mainWindow.loadFile(path.join(__dirname, 'src', 'index.html'));
   // mainWindow.webContents.openDevTools();
+
+  // Check GitHub for a newer release once the UI is up. The Windows .exe installer
+  // is what we ship, so only surface the update button on win32.
+  mainWindow.webContents.on('did-finish-load', () => {
+    if (process.platform !== 'win32') return;
+    checkUpdate()
+      .then((r) => {
+        if (r.newer && r.url && mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('update:available', r);
+        }
+      })
+      .catch(() => { /* offline / rate-limited — just skip */ });
+  });
 }
 
 // ---------------- pty management ----------------
@@ -225,13 +243,33 @@ ipcMain.handle('dialog:pickFolder', async (e, current) => {
 
 // ---------------- remote control (phone via Cloudflare tunnel) ----------------
 
+// The door PIN chosen from the QR modal is persisted here so it survives restarts
+// and is shared with the standalone CLI door (remote/cli.js reads the same file).
+function doorPinFile() { return path.join(app.getPath('userData'), 'door-pin'); }
+function readSavedPin() {
+  try { return fs.readFileSync(doorPinFile(), 'utf8').trim(); } catch { return ''; }
+}
+ipcMain.handle('remote:getPin', () => readSavedPin());
+ipcMain.handle('remote:setPin', (e, pin) => {
+  try {
+    const v = (pin == null ? '' : String(pin)).trim();
+    if (v) fs.writeFileSync(doorPinFile(), v, 'utf8');
+    else { try { fs.unlinkSync(doorPinFile()); } catch { /* none to clear */ } }
+    return { ok: true };
+  } catch (err) { return { ok: false, error: String((err && err.message) || err) }; }
+});
+
 ipcMain.handle('remote:open', async (e, opts) => {
   try {
     const r = getRemote();
+    // explicit PIN from the modal wins; otherwise reuse a previously saved one;
+    // otherwise undefined -> server generates a fresh random PIN.
+    const pin = (opts && opts.pin != null && String(opts.pin).trim()) || readSavedPin() || undefined;
     const result = await r.open({
       getWindow: () => mainWindow,
       userDataDir: app.getPath('userData'),
       controlEnabled: !(opts && opts.readOnly),
+      pin,
       onProgress: (frac) => {
         if (mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.webContents.send('remote:progress', frac);
@@ -247,6 +285,94 @@ ipcMain.handle('remote:open', async (e, opts) => {
 
 ipcMain.handle('remote:close', () => { try { return { ok: true, ...getRemote().close() }; } catch (err) { return { ok: false, error: String(err) }; } });
 ipcMain.handle('remote:status', () => { try { return { ok: true, ...getRemote().status() }; } catch (err) { return { ok: false, error: String(err) }; } });
+
+// ---------------- in-app updater (GitHub Releases) ----------------
+
+// GET a URL following redirects (GitHub asset URLs redirect to a CDN). Resolves a Buffer.
+function httpsGet(url) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, { headers: { 'User-Agent': 'termi-app' } }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        res.resume();
+        return resolve(httpsGet(res.headers.location));
+      }
+      if (res.statusCode !== 200) { res.resume(); return reject(new Error('HTTP ' + res.statusCode)); }
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+    });
+    req.on('error', reject);
+    req.setTimeout(15000, () => req.destroy(new Error('timeout')));
+  });
+}
+
+// Stream a URL (following redirects) to a file, reporting download fraction.
+function downloadTo(url, dest, onProgress) {
+  return new Promise((resolve, reject) => {
+    const go = (u) => {
+      https.get(u, { headers: { 'User-Agent': 'termi-app' } }, (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) { res.resume(); return go(res.headers.location); }
+        if (res.statusCode !== 200) { res.resume(); return reject(new Error('HTTP ' + res.statusCode)); }
+        const total = parseInt(res.headers['content-length'] || '0', 10);
+        let done = 0;
+        const out = fs.createWriteStream(dest);
+        res.on('data', (c) => { done += c.length; if (total && onProgress) onProgress(done / total); });
+        res.pipe(out);
+        out.on('finish', () => out.close(() => resolve(dest)));
+        out.on('error', reject);
+      }).on('error', reject);
+    };
+    go(url);
+  });
+}
+
+// Numeric semver compare: 1 if a>b, -1 if a<b, 0 if equal. Ignores a leading 'v'.
+function cmpVer(a, b) {
+  const pa = String(a).replace(/^v/, '').split('.').map(Number);
+  const pb = String(b).replace(/^v/, '').split('.').map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const x = pa[i] || 0, y = pb[i] || 0;
+    if (x > y) return 1;
+    if (x < y) return -1;
+  }
+  return 0;
+}
+
+let latestRelease = null;
+async function checkUpdate() {
+  const buf = await httpsGet(`https://api.github.com/repos/${UPDATE_REPO}/releases/latest`);
+  const rel = JSON.parse(buf.toString('utf8'));
+  const tag = rel.tag_name || '';
+  const asset = (rel.assets || []).find((a) => /\.exe$/i.test(a.name));
+  latestRelease = {
+    version: tag.replace(/^v/, ''),
+    tag,
+    url: asset ? asset.browser_download_url : null,
+    notes: rel.body || '',
+    current: app.getVersion(),
+    newer: !!tag && cmpVer(tag, app.getVersion()) > 0,
+  };
+  return latestRelease;
+}
+
+ipcMain.handle('update:check', async () => {
+  try { return { ok: true, ...(await checkUpdate()) }; }
+  catch (err) { return { ok: false, error: String((err && err.message) || err) }; }
+});
+
+ipcMain.handle('update:install', async () => {
+  try {
+    if (!latestRelease || !latestRelease.url) throw new Error('Δεν υπάρχει διαθέσιμο installer στην έκδοση.');
+    const dest = path.join(app.getPath('temp'), `termi-Setup-${latestRelease.version}.exe`);
+    await downloadTo(latestRelease.url, dest, (frac) => {
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('update:progress', frac);
+    });
+    // Launch the installer detached, then quit so it can replace our locked files.
+    require('child_process').spawn(dest, [], { detached: true, stdio: 'ignore' }).unref();
+    setTimeout(() => app.quit(), 600);
+    return { ok: true };
+  } catch (err) { return { ok: false, error: String((err && err.message) || err) }; }
+});
 
 // ---------------- app lifecycle ----------------
 

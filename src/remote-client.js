@@ -44,8 +44,29 @@
       : 'Καμία συσκευή ακόμη';
   }
 
+  // Prefill the PIN field with the previously saved code (if any).
+  async function prefillPin() {
+    try { $('remotePinInput').value = (await t.remoteGetPin()) || ''; }
+    catch { /* none saved */ }
+    setPinHint(false);
+  }
+  function setPinHint(isError, msg) {
+    const hint = $('remotePinHint');
+    const input = $('remotePinInput');
+    hint.classList.toggle('error', !!isError);
+    input.classList.toggle('invalid', !!isError);
+    hint.textContent = msg || 'Άφησέ το κενό για τυχαίο κωδικό κάθε φορά. Αποθηκεύεται για την επόμενη φορά.';
+  }
+
   async function start() {
     const readOnly = $('remoteReadOnly').checked;
+    const pin = ($('remotePinInput').value || '').trim();
+    if (pin && !/^\d{4,8}$/.test(pin)) {
+      setPinHint(true, 'Ο κωδικός πρέπει να είναι 4–8 ψηφία (ή κενό για τυχαίο).');
+      $('remotePinInput').focus();
+      return;
+    }
+    try { await t.remoteSetPin(pin); } catch { /* best effort persist */ }
     showPane('loading');
     $('remoteLoadingText').textContent = 'Προετοιμασία…';
     $('remoteProgress').classList.add('hidden');
@@ -55,7 +76,7 @@
       $('remoteProgressBar').style.width = Math.round(frac * 100) + '%';
     });
     try {
-      const r = await t.remoteOpen({ readOnly });
+      const r = await t.remoteOpen({ readOnly, pin });
       if (r && r.ok) {
         renderActive(r);
         clearInterval(statusTimer);
@@ -90,6 +111,7 @@
       clearInterval(statusTimer);
       statusTimer = setInterval(refreshStatus, 3000);
     } else {
+      await prefillPin();
       showPane('idle');
     }
   });

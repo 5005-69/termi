@@ -78,6 +78,11 @@ html, body {
 .winbtn .codicon { font-size: 12px; }
 .winbtn:hover { background: rgba(255,255,255,0.09); color: var(--text); }
 .winbtn-close:hover { background: #e81123; color: #fff; }
+.winbtn-update { color: #3fb950; }
+.winbtn-update .codicon { font-size: 14px; }
+.winbtn-update:hover { background: rgba(63,185,80,0.16); color: #56d364; }
+.winbtn-update.updating { color: var(--muted); pointer-events: none; }
+.winbtn-update.hidden { display: none; }
 
 #toolbar .brand {
   font-weight: 700;
@@ -828,6 +833,17 @@ body.dragging { cursor: grabbing; }
 .remote-body.hidden { display: none; }
 .remote-body p { color: var(--muted); font-size: 13px; line-height: 1.5; margin: 0; text-align: left; }
 .remote-opt { color: var(--text); font-size: 13px; display: flex; align-items: center; gap: 8px; align-self: flex-start; }
+.remote-pin-set { display: flex; flex-direction: column; gap: 5px; align-self: stretch; text-align: left; }
+.remote-pin-set > label { color: var(--text); font-size: 13px; font-weight: 600; }
+.remote-pin-set input {
+  width: 100%; box-sizing: border-box; padding: 8px 10px;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+  color: var(--text); font-size: 16px; letter-spacing: 3px; outline: none;
+}
+.remote-pin-set input:focus { border-color: var(--accent); }
+.remote-pin-set input.invalid { border-color: #f85149; }
+.remote-hint { color: var(--muted); font-size: 11px; letter-spacing: 0; }
+.remote-hint.error { color: #f85149; }
 .remote-primary, .remote-danger {
   width: 100%; padding: 11px; border-radius: 9px; border: none; cursor: pointer;
   font-size: 14px; font-weight: 600; color: #fff;

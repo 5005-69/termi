@@ -56,10 +56,26 @@ contextBridge.exposeInMainWorld('termi', {
   remoteOpen: (opts) => ipcRenderer.invoke('remote:open', opts || {}),
   remoteClose: () => ipcRenderer.invoke('remote:close'),
   remoteStatus: () => ipcRenderer.invoke('remote:status'),
+  remoteGetPin: () => ipcRenderer.invoke('remote:getPin'),
+  remoteSetPin: (pin) => ipcRenderer.invoke('remote:setPin', pin),
   onRemoteProgress: (cb) => {
     const h = (e, frac) => cb(frac);
     ipcRenderer.on('remote:progress', h);
     return () => ipcRenderer.removeListener('remote:progress', h);
+  },
+
+  // in-app updater (GitHub Releases)
+  updateCheck: () => ipcRenderer.invoke('update:check'),
+  updateInstall: () => ipcRenderer.invoke('update:install'),
+  onUpdateAvailable: (cb) => {
+    const h = (e, r) => cb(r);
+    ipcRenderer.on('update:available', h);
+    return () => ipcRenderer.removeListener('update:available', h);
+  },
+  onUpdateProgress: (cb) => {
+    const h = (e, frac) => cb(frac);
+    ipcRenderer.on('update:progress', h);
+    return () => ipcRenderer.removeListener('update:progress', h);
   },
 
   // window controls (frameless)
