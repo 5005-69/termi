@@ -1,6 +1,6 @@
 {
   "name": "termi",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Custom terminal manager with dynamic split layouts",
   "main": "main.js",
   "scripts": {

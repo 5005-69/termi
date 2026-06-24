@@ -71,6 +71,7 @@
     updateInstall: () => Promise.resolve({ ok: false, error: 'not supported on web' }),
     onUpdateAvailable: () => () => {},
     onUpdateProgress: () => () => {},
+    appVersion: () => Promise.resolve('web'),
   };
 
   // ---------------- enable xterm smooth (sub-line) scrolling ----------------

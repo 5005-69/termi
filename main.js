@@ -218,6 +218,8 @@ ipcMain.handle('git:init', (e, dir) => doOp(() => simpleGit(dir).init()));
 ipcMain.handle('clipboard:read', () => clipboard.readText());
 ipcMain.on('clipboard:write', (e, text) => clipboard.writeText(text || ''));
 
+ipcMain.handle('app:version', () => app.getVersion());
+
 ipcMain.handle('dialog:pickFolder', async (e, current) => {
   const res = await dialog.showOpenDialog(mainWindow, {
     title: 'Επιλογή φακέλου εργασίας',

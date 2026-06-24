@@ -52,6 +52,9 @@ contextBridge.exposeInMainWorld('termi', {
   // dialogs
   pickFolder: (current) => ipcRenderer.invoke('dialog:pickFolder', current),
 
+  // app info
+  appVersion: () => ipcRenderer.invoke('app:version'),
+
   // remote control (phone via tunnel)
   remoteOpen: (opts) => ipcRenderer.invoke('remote:open', opts || {}),
   remoteClose: () => ipcRenderer.invoke('remote:close'),

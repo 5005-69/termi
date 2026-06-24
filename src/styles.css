@@ -61,6 +61,7 @@ html, body {
 #toolbar button, #toolbar .window-controls { -webkit-app-region: no-drag; }
 
 .toolbar-spacer { flex: 1 1 auto; align-self: stretch; }
+.app-version { color: var(--muted); font-size: 11px; padding: 0 8px; -webkit-app-region: no-drag; user-select: none; }
 
 .window-controls { display: flex; align-items: stretch; height: 100%; }
 .winbtn {

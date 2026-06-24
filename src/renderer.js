@@ -2057,6 +2057,12 @@ window.termi.onFullscreenChange((fs) => {
   document.getElementById('win-full').title = fs ? 'Έξοδος πλήρους οθόνης (F11)' : 'Πλήρης οθόνη (F11)';
 });
 
+// version badge in the header (guarded: the phone bridge stubs appVersion -> 'web')
+const verEl = document.getElementById('app-version');
+if (verEl && window.termi.appVersion) {
+  window.termi.appVersion().then((v) => { verEl.textContent = v ? 'v' + v : ''; }).catch(() => {});
+}
+
 // in-app update button (left of fullscreen) — shown only when GitHub has a newer release.
 // Guarded: the phone (remote web app) runs this same renderer.js over the termi-bridge
 // shim, which has no updater API — so skip the wiring there instead of throwing.
