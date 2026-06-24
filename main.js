@@ -3,12 +3,9 @@ const path = require('path');
 const os = require('os');
 const fs = require('fs');
 const fsp = require('fs').promises;
-const https = require('https');
 const pty = require('node-pty');
 const simpleGit = require('simple-git');
-
-// GitHub repo used for the in-app updater (owner/name).
-const UPDATE_REPO = '5005-69/termi';
+const { autoUpdater } = require('electron-updater');
 
 /** @type {Map<string, import('node-pty').IPty>} */
 const ptys = new Map();
@@ -50,21 +47,8 @@ function createWindow() {
   mainWindow.loadFile(path.join(__dirname, 'src', 'index.html'));
   // mainWindow.webContents.openDevTools();
 
-  // Check GitHub for a newer release once the UI is up, then re-check periodically
-  // so a release published while the app is open still surfaces (no restart needed).
-  // The Windows .exe installer is what we ship, so only surface this on win32.
-  const notifyIfUpdate = () => {
-    if (process.platform !== 'win32') return;
-    checkUpdate()
-      .then((r) => {
-        if (r.newer && r.url && mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('update:available', r);
-        }
-      })
-      .catch(() => { /* offline / rate-limited — just skip */ });
-  };
-  mainWindow.webContents.on('did-finish-load', notifyIfUpdate);
-  setInterval(notifyIfUpdate, 30 * 60 * 1000);
+  // Start the electron-updater check once the UI is ready to receive events.
+  mainWindow.webContents.on('did-finish-load', setupUpdater);
 }
 
 // ---------------- pty management ----------------
@@ -289,92 +273,47 @@ ipcMain.handle('remote:open', async (e, opts) => {
 ipcMain.handle('remote:close', () => { try { return { ok: true, ...getRemote().close() }; } catch (err) { return { ok: false, error: String(err) }; } });
 ipcMain.handle('remote:status', () => { try { return { ok: true, ...getRemote().status() }; } catch (err) { return { ok: false, error: String(err) }; } });
 
-// ---------------- in-app updater (GitHub Releases) ----------------
+// ---------------- in-app updater (electron-updater + GitHub Releases) ----------------
+// Proper in-place NSIS update: keeps the install dir, the taskbar pin and the existing
+// desktop shortcut (no duplicate icon), and downloads only the diff. Replaces the old
+// "download the full installer and run it" approach. Only runs in a packaged win32 build.
 
-// GET a URL following redirects (GitHub asset URLs redirect to a CDN). Resolves a Buffer.
-function httpsGet(url) {
-  return new Promise((resolve, reject) => {
-    const req = https.get(url, { headers: { 'User-Agent': 'termi-app' } }, (res) => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        res.resume();
-        return resolve(httpsGet(res.headers.location));
-      }
-      if (res.statusCode !== 200) { res.resume(); return reject(new Error('HTTP ' + res.statusCode)); }
-      const chunks = [];
-      res.on('data', (c) => chunks.push(c));
-      res.on('end', () => resolve(Buffer.concat(chunks)));
-    });
-    req.on('error', reject);
-    req.setTimeout(15000, () => req.destroy(new Error('timeout')));
-  });
-}
+let updaterReady = false;
+function setupUpdater() {
+  if (updaterReady || process.platform !== 'win32' || !app.isPackaged) return;
+  updaterReady = true;
 
-// Stream a URL (following redirects) to a file, reporting download fraction.
-function downloadTo(url, dest, onProgress) {
-  return new Promise((resolve, reject) => {
-    const go = (u) => {
-      https.get(u, { headers: { 'User-Agent': 'termi-app' } }, (res) => {
-        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) { res.resume(); return go(res.headers.location); }
-        if (res.statusCode !== 200) { res.resume(); return reject(new Error('HTTP ' + res.statusCode)); }
-        const total = parseInt(res.headers['content-length'] || '0', 10);
-        let done = 0;
-        const out = fs.createWriteStream(dest);
-        res.on('data', (c) => { done += c.length; if (total && onProgress) onProgress(done / total); });
-        res.pipe(out);
-        out.on('finish', () => out.close(() => resolve(dest)));
-        out.on('error', reject);
-      }).on('error', reject);
-    };
-    go(url);
-  });
-}
+  autoUpdater.autoDownload = false;          // wait for the user to click the update button
+  autoUpdater.autoInstallOnAppQuit = true;
 
-// Numeric semver compare: 1 if a>b, -1 if a<b, 0 if equal. Ignores a leading 'v'.
-function cmpVer(a, b) {
-  const pa = String(a).replace(/^v/, '').split('.').map(Number);
-  const pb = String(b).replace(/^v/, '').split('.').map(Number);
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const x = pa[i] || 0, y = pb[i] || 0;
-    if (x > y) return 1;
-    if (x < y) return -1;
-  }
-  return 0;
-}
-
-let latestRelease = null;
-async function checkUpdate() {
-  const buf = await httpsGet(`https://api.github.com/repos/${UPDATE_REPO}/releases/latest`);
-  const rel = JSON.parse(buf.toString('utf8'));
-  const tag = rel.tag_name || '';
-  const asset = (rel.assets || []).find((a) => /\.exe$/i.test(a.name));
-  latestRelease = {
-    version: tag.replace(/^v/, ''),
-    tag,
-    url: asset ? asset.browser_download_url : null,
-    notes: rel.body || '',
-    current: app.getVersion(),
-    newer: !!tag && cmpVer(tag, app.getVersion()) > 0,
+  const send = (channel, payload) => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload);
   };
-  return latestRelease;
+
+  autoUpdater.on('update-available', (info) => send('update:available', { version: info.version, newer: true }));
+  autoUpdater.on('download-progress', (p) => send('update:progress', (p.percent || 0) / 100));
+  autoUpdater.on('update-downloaded', () => {
+    // silent, in-place install that preserves shortcuts/pin, then relaunch.
+    autoUpdater.quitAndInstall(true, true);
+  });
+  autoUpdater.on('error', (err) => send('update:error', String((err && err.message) || err)));
+
+  autoUpdater.checkForUpdates().catch(() => { /* offline / no release yet */ });
+  setInterval(() => autoUpdater.checkForUpdates().catch(() => {}), 30 * 60 * 1000);
 }
 
 ipcMain.handle('update:check', async () => {
-  try { return { ok: true, ...(await checkUpdate()) }; }
-  catch (err) { return { ok: false, error: String((err && err.message) || err) }; }
+  try {
+    if (process.platform !== 'win32' || !app.isPackaged) return { ok: false, error: 'updater available only in the installed app' };
+    const r = await autoUpdater.checkForUpdates();
+    return { ok: true, version: r && r.updateInfo && r.updateInfo.version };
+  } catch (err) { return { ok: false, error: String((err && err.message) || err) }; }
 });
 
+// Download the pending update; the 'update-downloaded' handler then quits & installs.
 ipcMain.handle('update:install', async () => {
-  try {
-    if (!latestRelease || !latestRelease.url) throw new Error('Δεν υπάρχει διαθέσιμο installer στην έκδοση.');
-    const dest = path.join(app.getPath('temp'), `termi-Setup-${latestRelease.version}.exe`);
-    await downloadTo(latestRelease.url, dest, (frac) => {
-      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('update:progress', frac);
-    });
-    // Launch the installer detached, then quit so it can replace our locked files.
-    require('child_process').spawn(dest, [], { detached: true, stdio: 'ignore' }).unref();
-    setTimeout(() => app.quit(), 600);
-    return { ok: true };
-  } catch (err) { return { ok: false, error: String((err && err.message) || err) }; }
+  try { await autoUpdater.downloadUpdate(); return { ok: true }; }
+  catch (err) { return { ok: false, error: String((err && err.message) || err) }; }
 });
 
 // ---------------- app lifecycle ----------------
