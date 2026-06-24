@@ -2057,33 +2057,37 @@ window.termi.onFullscreenChange((fs) => {
   document.getElementById('win-full').title = fs ? 'Έξοδος πλήρους οθόνης (F11)' : 'Πλήρης οθόνη (F11)';
 });
 
-// in-app update button (left of fullscreen) — shown only when GitHub has a newer release
+// in-app update button (left of fullscreen) — shown only when GitHub has a newer release.
+// Guarded: the phone (remote web app) runs this same renderer.js over the termi-bridge
+// shim, which has no updater API — so skip the wiring there instead of throwing.
 const updBtn = document.getElementById('win-update');
-let updating = false;
-window.termi.onUpdateAvailable((rel) => {
-  if (!rel || !rel.newer) return;
-  updBtn.classList.remove('hidden');
-  updBtn.dataset.version = rel.version;
-  updBtn.title = `Νέα έκδοση ${rel.version} διαθέσιμη — κλικ για ενημέρωση`;
-});
-updBtn.addEventListener('click', async () => {
-  if (updating) return;
-  const ver = updBtn.dataset.version || '';
-  if (!confirm(`Να γίνει λήψη και εγκατάσταση της έκδοσης ${ver};\nΗ εφαρμογή θα κλείσει για να ολοκληρωθεί η ενημέρωση.`)) return;
-  updating = true;
-  updBtn.classList.add('updating');
-  const off = window.termi.onUpdateProgress((frac) => {
-    updBtn.title = 'Λήψη ενημέρωσης… ' + Math.round(frac * 100) + '%';
+if (updBtn && window.termi.onUpdateAvailable) {
+  let updating = false;
+  window.termi.onUpdateAvailable((rel) => {
+    if (!rel || !rel.newer) return;
+    updBtn.classList.remove('hidden');
+    updBtn.dataset.version = rel.version;
+    updBtn.title = `Νέα έκδοση ${rel.version} διαθέσιμη — κλικ για ενημέρωση`;
   });
-  const r = await window.termi.updateInstall();
-  if (off) off();
-  if (!r || !r.ok) { // on success the app quits, so we only land here on failure
-    updating = false;
-    updBtn.classList.remove('updating');
-    updBtn.title = 'Αποτυχία ενημέρωσης — δοκίμασε ξανά';
-    alert('Αποτυχία ενημέρωσης: ' + ((r && r.error) || 'άγνωστο σφάλμα'));
-  }
-});
+  updBtn.addEventListener('click', async () => {
+    if (updating) return;
+    const ver = updBtn.dataset.version || '';
+    if (!confirm(`Να γίνει λήψη και εγκατάσταση της έκδοσης ${ver};\nΗ εφαρμογή θα κλείσει για να ολοκληρωθεί η ενημέρωση.`)) return;
+    updating = true;
+    updBtn.classList.add('updating');
+    const off = window.termi.onUpdateProgress((frac) => {
+      updBtn.title = 'Λήψη ενημέρωσης… ' + Math.round(frac * 100) + '%';
+    });
+    const r = await window.termi.updateInstall();
+    if (off) off();
+    if (!r || !r.ok) { // on success the app quits, so we only land here on failure
+      updating = false;
+      updBtn.classList.remove('updating');
+      updBtn.title = 'Αποτυχία ενημέρωσης — δοκίμασε ξανά';
+      alert('Αποτυχία ενημέρωσης: ' + ((r && r.error) || 'άγνωστο σφάλμα'));
+    }
+  });
+}
 document.getElementById('pickRoot').addEventListener('click', pickRoot);
 document.getElementById('newFile').addEventListener('click', newFileFlow);
 document.getElementById('newFolder').addEventListener('click', newFolderFlow);

@@ -65,6 +65,12 @@
     winFullscreen: () => { try { if (document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen(); } catch (e) { /* */ } },
     onMaximizeChange: (cb) => { maxCbs.push(cb); },
     onFullscreenChange: (cb) => { fullCbs.push(cb); },
+    // in-app updater — desktop-only; on the phone these are inert no-ops so the
+    // shared renderer.js can call them without throwing (no update button shown).
+    updateCheck: () => Promise.resolve({ ok: false, error: 'not supported on web' }),
+    updateInstall: () => Promise.resolve({ ok: false, error: 'not supported on web' }),
+    onUpdateAvailable: () => () => {},
+    onUpdateProgress: () => () => {},
   };
 
   // ---------------- enable xterm smooth (sub-line) scrolling ----------------
