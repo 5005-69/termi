@@ -14,10 +14,22 @@ const COLORS = ['#58a6ff', '#3fb950', '#f778ba', '#d29922', '#a371f7', '#ff7b72'
 let colorIdx = 0;
 let nextId = 1;
 
+// Quirky codenames given to fresh terminals instead of "terminal 1, 2, 3…".
+const TERM_NAMES = [
+  'Cosmic Goat', 'Quantum Pickle', 'Ninja Toaster', 'Rogue Banana', 'Disco Kernel',
+  'Funky Daemon', 'Sneaky Panda', 'Turbo Snail', 'Void Walker', 'Glitch Goblin',
+  'Neon Llama', 'Pixel Wizard', 'Byte Goblin', 'Cyber Otter', 'Hyper Waffle',
+  'Phantom Yak', 'Laser Llama', 'Atomic Newt', 'Velvet Hammer', 'Spicy Pixel',
+  'Electric Sheep', 'Caffeine Daemon', 'Lone Wolf', 'Captain Kernel', 'Wandering Sudo',
+  'Zombie Process', 'Segfault Sam', 'Null Pointer', 'Kernel Panic', 'Grumpy Cache',
+  'Drunken Master', 'Salty Sailor', 'Mad Hatter', 'Soggy Biscuit', 'Rubber Duck',
+];
+function randomTermName() { return TERM_NAMES[Math.floor(Math.random() * TERM_NAMES.length)]; }
+
 function makeLeaf(name) {
   const id = 'p' + (nextId++);
   const color = COLORS[colorIdx++ % COLORS.length];
-  return { type: 'leaf', kind: 'terminal', id, name: name || ('terminal ' + id.slice(1)), color, cwd: null };
+  return { type: 'leaf', kind: 'terminal', id, name: name || randomTermName(), color, cwd: null };
 }
 
 function makeEditorLeaf(filePath) {
@@ -145,7 +157,8 @@ function mountView(leaf) {
     fontSize: leaf.fontSize || 13,
     cursorBlink: true,
     allowProposedApi: true,
-    theme: TERM_THEME,
+    // cursor (the "pillar" at the active line) matches the pane's frame color
+    theme: { ...TERM_THEME, cursor: leaf.color || TERM_THEME.cursor },
   });
   const fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
@@ -806,6 +819,11 @@ function renderPane(leaf) {
     leaf.color = colorInput.value;
     pane.style.borderColor = leaf.color;
     dot.style.background = leaf.color;
+    // keep the terminal cursor in sync with the frame color
+    const v = views.get(leaf.id);
+    if (v && v.kind === 'terminal') {
+      try { v.term.options.theme = { ...TERM_THEME, cursor: leaf.color }; } catch { /* */ }
+    }
   });
 
   const name = document.createElement('input');

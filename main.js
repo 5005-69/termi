@@ -50,9 +50,10 @@ function createWindow() {
   mainWindow.loadFile(path.join(__dirname, 'src', 'index.html'));
   // mainWindow.webContents.openDevTools();
 
-  // Check GitHub for a newer release once the UI is up. The Windows .exe installer
-  // is what we ship, so only surface the update button on win32.
-  mainWindow.webContents.on('did-finish-load', () => {
+  // Check GitHub for a newer release once the UI is up, then re-check periodically
+  // so a release published while the app is open still surfaces (no restart needed).
+  // The Windows .exe installer is what we ship, so only surface this on win32.
+  const notifyIfUpdate = () => {
     if (process.platform !== 'win32') return;
     checkUpdate()
       .then((r) => {
@@ -61,7 +62,9 @@ function createWindow() {
         }
       })
       .catch(() => { /* offline / rate-limited — just skip */ });
-  });
+  };
+  mainWindow.webContents.on('did-finish-load', notifyIfUpdate);
+  setInterval(notifyIfUpdate, 30 * 60 * 1000);
 }
 
 // ---------------- pty management ----------------
