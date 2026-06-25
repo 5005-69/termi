@@ -38,6 +38,17 @@ function makeEditorLeaf(filePath) {
   return { type: 'leaf', kind: 'editor', id, name: basename(filePath), color, filePath };
 }
 
+function makeBrowserLeaf(url) {
+  const id = 'p' + (nextId++);
+  const color = COLORS[colorIdx++ % COLORS.length];
+  return { type: 'leaf', kind: 'webview', id, name: 'Browser', color, url: url || 'https://www.google.com' };
+}
+
+// True when this renderer runs in a phone browser over the remote bridge (window.termi
+// is the web shim, version 'web-*'). <webview> is Electron-only, so browser panes fall
+// back to opening a real browser tab there.
+const isRemote = !!(window.termi && String(window.termi.version || '').startsWith('web'));
+
 function basename(p) { return p ? p.split(/[\\/]/).pop() : ''; }
 function extOf(p) { const b = basename(p); const i = b.lastIndexOf('.'); return i > 0 ? b.slice(i + 1).toLowerCase() : ''; }
 function escapeHtml(s) {
@@ -119,6 +130,14 @@ function saveLaunchers() {
   localStorage.setItem('termi.launchers', JSON.stringify(launchers));
 }
 let launchers = loadLaunchers();
+
+// ---- saved web apps (define name+URL once, reusable browser launchers) ----
+function loadWebApps() {
+  try { return JSON.parse(localStorage.getItem('termi.webapps') || '[]'); }
+  catch { return []; }
+}
+function saveWebApps() { localStorage.setItem('termi.webapps', JSON.stringify(webApps)); }
+let webApps = loadWebApps();
 
 function runLauncher(L, paneId) {
   if (!views.get(paneId)) return;
@@ -336,6 +355,9 @@ function destroyView(id) {
     if (v.dirty && v.editor) window.termi.writeFile(v.filePath, v.editor.getModel().getValue());
     try { v.editor && v.editor.dispose(); } catch { /* */ }
     try { v.model && v.model.dispose(); } catch { /* */ }
+  } else if (v.kind === 'webview') {
+    nameInputs.delete(id);
+    try { v.wv.remove(); } catch { /* */ }   // removing from the layer destroys the guest
   }
   views.delete(id);
 }
@@ -349,6 +371,101 @@ window.termi.onExit(({ id }) => {
   const v = views.get(id);
   if (v && v.kind === 'terminal') v.term.write('\r\n\x1b[90m[process exited]\x1b[0m\r\n');
 });
+
+// ---------------- web browser view (webview) ----------------
+// The <webview> guest reloads if it's detached/reattached in the DOM, but render()
+// rebuilds the whole pane tree (workspace.innerHTML='') on every layout change. So the
+// webviews live in ONE persistent overlay layer and we position each one over an empty
+// placeholder "slot" inside its pane body — they're never reparented, so they never
+// reload on a split/resize/drag.
+const webviewLayer = (() => {
+  const l = document.createElement('div');
+  l.id = 'webview-layer';
+  document.body.appendChild(l);
+  return l;
+})();
+const nameInputs = new Map(); // leaf.id -> pane-name input (so a page title can update it)
+
+let webviewLayoutRaf = null;
+function scheduleWebviewLayout() {
+  if (webviewLayoutRaf) return;
+  webviewLayoutRaf = requestAnimationFrame(() => { webviewLayoutRaf = null; layoutWebviews(); });
+}
+// per-slot observer: covers divider drags, window resizes, sidebar resize — anything that
+// changes a slot's box makes us reposition the webview to keep it glued to its pane.
+const webviewRO = new ResizeObserver(scheduleWebviewLayout);
+window.addEventListener('resize', scheduleWebviewLayout);
+
+function layoutWebviews() {
+  const visible = new Set(visibleLeafIds());
+  const base = webviewLayer.getBoundingClientRect();
+  for (const [id, v] of views) {
+    if (v.kind !== 'webview') continue;
+    if (!visible.has(id) || !v.slot || !v.slot.isConnected) { v.wv.style.display = 'none'; continue; }
+    const r = v.slot.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) { v.wv.style.display = 'none'; continue; }
+    v.wv.style.display = 'flex';
+    v.wv.style.left = (r.left - base.left) + 'px';
+    v.wv.style.top = (r.top - base.top) + 'px';
+    v.wv.style.width = r.width + 'px';
+    v.wv.style.height = r.height + 'px';
+  }
+}
+
+function mountWebviewView(leaf) {
+  let v = views.get(leaf.id);
+  if (v) return v;
+
+  const wv = document.createElement('webview');
+  wv.setAttribute('partition', 'persist:webapps');  // one shared, persistent profile -> logins stick
+  wv.setAttribute('src', leaf.url || 'about:blank');
+  wv.style.display = 'none';
+  webviewLayer.appendChild(wv);
+
+  // el/ro kept for the shared views-Map contract (destroyView calls v.ro.disconnect()).
+  v = { kind: 'webview', el: wv, wv, ro: { disconnect() {} }, slot: null, urlInput: null };
+
+  const syncUrl = (u) => {
+    if (!u) return;
+    leaf.url = u;
+    if (v.urlInput && document.activeElement !== v.urlInput) v.urlInput.value = u;
+  };
+  wv.addEventListener('did-navigate', (e) => syncUrl(e.url));
+  wv.addEventListener('did-navigate-in-page', (e) => syncUrl(e.url));
+  wv.addEventListener('page-title-updated', (e) => {
+    if (!e.title) return;
+    leaf.name = e.title;
+    const ni = nameInputs.get(leaf.id);
+    if (ni && document.activeElement !== ni) ni.value = e.title;
+  });
+  views.set(leaf.id, v);
+  return v;
+}
+
+// Turn what the user typed into a URL, the way a browser address bar does:
+// localhost / IPs / host:port -> http (dev servers), a domain -> https, else a search.
+function resolveAddress(raw) {
+  const s = (raw || '').trim();
+  if (!s) return '';
+  // already has a scheme (http:, file:, about:, …); the (?!\d) keeps "localhost:3000"
+  // from looking like a "localhost:" scheme so it's treated as host:port instead.
+  if (/^[a-z][a-z0-9+.-]*:(?!\d)/i.test(s)) return s;
+  const host = s.split(/[/?#]/)[0];                        // strip path/query -> host[:port]
+  const isLocalhost = /^localhost(:\d+)?$/i.test(host);
+  const isIpv4 = /^\d{1,3}(\.\d{1,3}){3}(:\d+)?$/.test(host);
+  const isIpv6 = /^\[[0-9a-fA-F:]+\](:\d+)?$/.test(host);
+  if (isLocalhost || isIpv4 || isIpv6) return 'http://' + s;   // local -> http
+  if (!/\s/.test(s) && /^[^\s/?#]+\.[^\s/?#]{2,}/.test(host)) return 'https://' + s;  // a domain -> https
+  if (/^[^\s/?#]+:\d+$/.test(host)) return 'http://' + s;      // bare host:port -> http
+  return 'https://www.google.com/search?q=' + encodeURIComponent(s);  // otherwise: search
+}
+
+function navigateWebview(v, leaf, raw) {
+  const url = resolveAddress(raw);
+  if (!url) return;
+  leaf.url = url;
+  try { v.wv.src = url; } catch { /* */ }
+}
 
 // ---------------- editor view cache ----------------
 
@@ -706,8 +823,9 @@ function visibleLeafIds() {
 // ---------------- rendering ----------------
 
 function render() {
+  webviewRO.disconnect();        // slots are about to be rebuilt; re-observe the new ones
   workspace.innerHTML = '';
-  if (!root) { renderEmptyState(); return; }
+  if (!root) { renderEmptyState(); layoutWebviews(); return; }
   if (fullscreenId) {
     const leaf = findLeaf(fullscreenId);
     if (leaf) {
@@ -723,6 +841,7 @@ function render() {
     workspace.appendChild(renderNode(root));
   }
   visibleLeafIds().forEach(scheduleFit);
+  scheduleWebviewLayout();
 }
 
 function renderEmptyState() {
@@ -880,6 +999,43 @@ function renderPane(leaf) {
     body.className = 'pane-body editor-body';
     if (v.preview) v.preview.style.fontSize = (leaf.fontSize || 13) + 'px';
     body.appendChild(v.el);
+  } else if (leaf.kind === 'webview') {
+    pane.classList.add('webview-pane');
+    const v = mountWebviewView(leaf);
+    nameInputs.set(leaf.id, name);
+
+    const navBtn = (icon, title, fn) => {
+      const b = document.createElement('button');
+      b.className = 'wv-nav';
+      b.innerHTML = `<i class="codicon codicon-${icon}"></i>`;
+      b.title = title;
+      b.addEventListener('click', (e) => { e.stopPropagation(); try { fn(); } catch { /* */ } });
+      return b;
+    };
+    const back = navBtn('arrow-left', 'Πίσω', () => { if (v.wv.canGoBack && v.wv.canGoBack()) v.wv.goBack(); });
+    const fwd = navBtn('arrow-right', 'Μπροστά', () => { if (v.wv.canGoForward && v.wv.canGoForward()) v.wv.goForward(); });
+    const reload = navBtn('refresh', 'Ανανέωση', () => v.wv.reload());
+
+    const urlInput = document.createElement('input');
+    urlInput.className = 'wv-url';
+    urlInput.spellcheck = false;
+    urlInput.value = leaf.url || '';
+    urlInput.placeholder = 'Διεύθυνση ή αναζήτηση…';
+    urlInput.addEventListener('pointerdown', (e) => e.stopPropagation()); // don't start a pane drag
+    urlInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); navigateWebview(v, leaf, urlInput.value); urlInput.blur(); }
+    });
+    v.urlInput = urlInput;
+
+    const star = navBtn('star-empty', 'Αποθήκευση ως εφαρμογή', () => saveCurrentAsApp(leaf));
+
+    bar.append(dot, colorInput, name, back, fwd, reload, urlInput, star, fsBtn, closeBtn);
+    body.className = 'pane-body webview-body';
+    const slot = document.createElement('div');
+    slot.className = 'webview-slot';
+    v.slot = slot;
+    webviewRO.observe(slot);
+    body.appendChild(slot);
   } else {
     const launcherBtn = document.createElement('button');
     launcherBtn.textContent = '⚡';
@@ -1001,6 +1157,25 @@ function updateFocusClasses() {
 function addPane() {
   if (fullscreenId) fullscreenId = null;
   const leaf = makeLeaf();
+  if (!root) {
+    root = leaf;
+    focusedId = leaf.id;
+    render();
+    return;
+  }
+  const target = findLeaf(focusedId) || firstLeaf(root);
+  splitTarget(target, leaf, 'right');
+  focusedId = leaf.id;
+  render();
+}
+
+// Open a web page in a new browser pane (split off the focused one). On the phone
+// (remote) there's no <webview>, so fall back to a real browser tab.
+function openBrowserPane(url, name) {
+  if (isRemote) { window.open(url || 'https://www.google.com', '_blank'); return; }
+  if (fullscreenId) fullscreenId = null;
+  const leaf = makeBrowserLeaf(url);
+  if (name) leaf.name = name;
   if (!root) {
     root = leaf;
     focusedId = leaf.id;
@@ -1191,6 +1366,106 @@ function openLauncherModal() {
   }
   modal.querySelector('.m-save').addEventListener('click', save);
   modal.addEventListener('keydown', (e) => { if (e.key === 'Enter') save(); });
+}
+
+// ---------------- web browser: + browser menu + saved apps ----------------
+
+// Dropdown anchored to the "+ browser" toolbar button: a blank tab, your saved apps,
+// and an "add app" entry. Clicking an app opens it in a pane (or a tab on the phone).
+function openBrowserMenu(anchor) {
+  document.querySelectorAll('.browser-menu').forEach((m) => m.remove());
+  const menu = document.createElement('div');
+  menu.className = 'browser-menu';
+
+  const addItem = (label, icon, onClick, opts = {}) => {
+    const it = document.createElement('div');
+    it.className = 'bm-item' + (opts.cls ? ' ' + opts.cls : '');
+    it.innerHTML = `<i class="codicon codicon-${icon}"></i><span class="bm-label"></span>`;
+    it.querySelector('.bm-label').textContent = label;
+    if (opts.title) it.title = opts.title;
+    it.addEventListener('click', (e) => { e.stopPropagation(); onClick(); });
+    if (opts.onDelete) {
+      const del = document.createElement('span');
+      del.className = 'bm-del'; del.textContent = '✕'; del.title = 'Διαγραφή';
+      del.addEventListener('click', (e) => { e.stopPropagation(); opts.onDelete(); });
+      it.appendChild(del);
+    }
+    menu.appendChild(it);
+    return it;
+  };
+  const sep = () => { const s = document.createElement('div'); s.className = 'bm-sep'; menu.appendChild(s); };
+
+  addItem('Νέα κενή καρτέλα', 'globe', () => { close(); openBrowserPane(); });
+  if (webApps.length) {
+    sep();
+    webApps.forEach((app) => {
+      addItem(app.name, 'star-full', () => { close(); openBrowserPane(app.url, app.name); }, {
+        title: app.url,
+        onDelete: () => { webApps = webApps.filter((a) => a.id !== app.id); saveWebApps(); close(); openBrowserMenu(anchor); },
+      });
+    });
+  }
+  sep();
+  addItem('Προσθήκη εφαρμογής…', 'add', () => { close(); openWebAppModal({}); }, { cls: 'bm-add' });
+
+  document.body.appendChild(menu);
+  const r = anchor.getBoundingClientRect();
+  menu.style.left = Math.min(r.left, window.innerWidth - menu.offsetWidth - 8) + 'px';
+  menu.style.top = (r.bottom + 4) + 'px';
+
+  function close() { menu.remove(); document.removeEventListener('pointerdown', outside, true); window.removeEventListener('keydown', esc, true); }
+  function outside(e) { if (!menu.contains(e.target) && e.target !== anchor) close(); }
+  function esc(e) { if (e.key === 'Escape') close(); }
+  setTimeout(() => { document.addEventListener('pointerdown', outside, true); window.addEventListener('keydown', esc, true); }, 0);
+}
+
+// Modal to define/save a web app (name + URL). Reuses the launcher modal styling.
+function openWebAppModal(prefill) {
+  const backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  modal.innerHTML = `
+    <h3>Αποθήκευση εφαρμογής</h3>
+    <label>Όνομα<input type="text" class="m-name" placeholder="π.χ. YouTube" spellcheck="false"></label>
+    <label>Διεύθυνση (URL)<input type="text" class="m-url" placeholder="https://..." spellcheck="false"></label>
+    <div class="m-hint">Θα γίνει επαναχρησιμοποιήσιμο κουμπί στο μενού «+ browser».</div>
+    <div class="m-actions">
+      <button type="button" class="m-cancel">Άκυρο</button>
+      <button type="button" class="m-save">Αποθήκευση</button>
+    </div>
+  `;
+  backdrop.appendChild(modal);
+  document.body.appendChild(backdrop);
+
+  const nameI = modal.querySelector('.m-name');
+  const urlI = modal.querySelector('.m-url');
+  nameI.value = prefill.name || '';
+  urlI.value = prefill.url || '';
+  (nameI.value ? urlI : nameI).focus();
+
+  function close() { backdrop.remove(); window.removeEventListener('keydown', esc); }
+  function esc(e) { if (e.key === 'Escape') close(); }
+  window.addEventListener('keydown', esc);
+  modal.querySelector('.m-cancel').addEventListener('click', close);
+  backdrop.addEventListener('click', (e) => { if (e.target === backdrop) close(); });
+
+  function save() {
+    const name = nameI.value.trim();
+    if (!name) { nameI.focus(); return; }
+    if (!urlI.value.trim()) { urlI.focus(); return; }
+    const url = resolveAddress(urlI.value);
+    webApps.push({ id: 'w' + Date.now(), name, url });
+    saveWebApps();
+    close();
+  }
+  modal.querySelector('.m-save').addEventListener('click', save);
+  modal.addEventListener('keydown', (e) => { if (e.key === 'Enter') save(); });
+}
+
+// ★ in a browser pane bar -> save its current page as a reusable app.
+function saveCurrentAsApp(leaf) {
+  openWebAppModal({ name: leaf.name && leaf.name !== 'Browser' ? leaf.name : '', url: leaf.url || '' });
 }
 
 // ---------------- file explorer sidebar ----------------
@@ -2051,10 +2326,31 @@ window.termi.onMaximizeChange((max) => {
   const i = document.querySelector('#win-max .codicon');
   if (i) i.className = 'codicon ' + (max ? 'codicon-chrome-restore' : 'codicon-chrome-maximize');
 });
+
+// --- auto-hide the header in fullscreen (the ⛶ / F11 button), peek on hover ---
+// A dedicated top hot-zone reveals it: the header itself is a -webkit-app-region drag
+// area, and drag regions swallow mouse events, so hovering the bar can't be detected
+// reliably. The hot-zone is a normal (no-drag) element above the webviews; mouseenter
+// fires instantly. We hide again based on the cursor's Y (not the bar's own events).
+let headerHideActive = false;
+const headerHotzone = document.createElement('div');
+headerHotzone.id = 'header-hotzone';
+document.body.appendChild(headerHotzone);
+
+headerHotzone.addEventListener('mouseenter', () => {
+  if (headerHideActive) document.body.classList.add('header-peek');
+});
+document.addEventListener('mousemove', (e) => {
+  if (headerHideActive && e.clientY > 40) document.body.classList.remove('header-peek');
+});
+
 window.termi.onFullscreenChange((fs) => {
   const i = document.querySelector('#win-full .codicon');
   if (i) i.className = 'codicon ' + (fs ? 'codicon-screen-normal' : 'codicon-screen-full');
   document.getElementById('win-full').title = fs ? 'Έξοδος πλήρους οθόνης (F11)' : 'Πλήρης οθόνη (F11)';
+  headerHideActive = fs;
+  document.body.classList.toggle('header-hidden', fs);
+  if (!fs) document.body.classList.remove('header-peek');
 });
 
 // version badge in the header (guarded: the phone bridge stubs appVersion -> 'web')
@@ -2163,6 +2459,7 @@ sidebarResizer.addEventListener('pointerdown', (e) => {
 });
 
 document.getElementById('addPane').addEventListener('click', addPane);
+document.getElementById('addBrowser').addEventListener('click', (e) => openBrowserMenu(e.currentTarget));
 window.addEventListener('keydown', (e) => {
   if (e.key === 'F11') { e.preventDefault(); window.termi.winFullscreen(); return; }
   if (e.ctrlKey && e.key.toLowerCase() === 't') { e.preventDefault(); addPane(); return; }

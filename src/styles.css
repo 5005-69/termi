@@ -57,8 +57,29 @@ html, body {
   -webkit-app-region: drag; /* whole header drags the frameless window */
 }
 #toolbar button#toggleSidebar, #toolbar button#scmBtn { padding: 2px 7px; font-size: 12px; }
-#toolbar button#addPane { padding: 2px 9px; font-size: 12px; }
+#toolbar button#addPane, #toolbar button#addBrowser { padding: 2px 9px; font-size: 12px; }
 #toolbar button, #toolbar .window-controls { -webkit-app-region: no-drag; }
+
+/* Auto-hide the header in fullscreen; it peeks back when the cursor reaches the top edge.
+   #main fills the freed space; the bar slides in as an absolute overlay above the content
+   (incl. webviews) when peeking. The hot-zone is a thin no-drag strip at the very top that
+   catches the hover reliably (the bar itself is a drag region and swallows mouse events). */
+body.header-hidden #main { top: 0; }
+body.header-hidden #toolbar {
+  position: absolute; top: 0; left: 0; right: 0;
+  z-index: 100;
+  transform: translateY(-100%);
+  transition: transform 0.13s ease-out;
+  will-change: transform;
+}
+body.header-hidden.header-peek #toolbar { transform: translateY(0); }
+
+#header-hotzone { display: none; }
+body.header-hidden #header-hotzone {
+  display: block;
+  position: fixed; top: 0; left: 0; right: 0;
+  height: 8px; z-index: 99;
+}
 
 .toolbar-spacer { flex: 1 1 auto; align-self: stretch; }
 .app-version { color: var(--muted); font-size: 11px; padding: 0 8px; -webkit-app-region: no-drag; user-select: none; }
@@ -457,6 +478,47 @@ html, body {
 .term-host .xterm { height: 100%; }
 .term-host .xterm-viewport { overflow-y: auto; }
 .term-host.term-droptarget { outline: 2px dashed #58a6ff; outline-offset: -2px; }
+
+/* ---- Web browser pane ---- */
+/* The actual <webview> lives in #webview-layer (never reparented, so it never reloads
+   on a layout change); this slot just reserves the body area we position it over. */
+.pane-body.webview-body { padding: 0; background: #fff; }
+.webview-slot { width: 100%; height: 100%; }
+
+#webview-layer { position: fixed; inset: 0; pointer-events: none; z-index: 6; }
+#webview-layer webview { position: absolute; pointer-events: auto; background: #fff; display: flex; }
+/* while a pane is being dragged, let elementFromPoint fall through to the pane underneath */
+body.dragging #webview-layer webview { pointer-events: none; }
+
+.pane-bar button.wv-nav { padding: 3px 4px; display: inline-flex; align-items: center; }
+.pane-bar button.wv-nav .codicon { font-size: 13px; }
+.pane-bar .wv-url {
+  flex: 1 1 60px; min-width: 40px;
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 5px;
+  padding: 2px 7px; font-size: 11px; outline: none;
+}
+.pane-bar .wv-url:focus { border-color: var(--accent); }
+
+/* ---- + browser dropdown menu ---- */
+.browser-menu {
+  position: fixed; z-index: 2600;
+  min-width: 230px; max-width: 320px;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; box-shadow: 0 12px 40px rgba(0,0,0,.5);
+  padding: 5px; overflow: hidden;
+}
+.browser-menu .bm-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 9px; border-radius: 6px; cursor: pointer;
+  font-size: 13px; color: var(--text); white-space: nowrap;
+}
+.browser-menu .bm-item:hover { background: rgba(255,255,255,0.08); }
+.browser-menu .bm-item .bm-label { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; }
+.browser-menu .bm-item .bm-del { opacity: .5; padding: 0 4px; }
+.browser-menu .bm-item .bm-del:hover { opacity: 1; color: var(--accent); }
+.browser-menu .bm-sep { height: 1px; background: var(--border); margin: 4px 2px; }
+.browser-menu .bm-item.bm-add { color: var(--muted); }
 
 /* ---- Editor pane ---- */
 .pane-body.editor-body { padding: 0; background: #1e1e1e; }

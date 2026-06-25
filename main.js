@@ -36,6 +36,7 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       plugins: true, // enable Chromium's built-in PDF viewer
+      webviewTag: true, // enable <webview> for in-pane web browser panes
     },
   });
 
