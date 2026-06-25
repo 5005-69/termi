@@ -667,6 +667,23 @@ body.dragging #webview-layer webview { pointer-events: none; }
 }
 .launcher-chip:hover { background: #283041; }
 .launcher-chip.chip-dragging { opacity: 0.5; cursor: grabbing; }
+.launcher-chip.chip-category { font-weight: 600; }
+.launcher-chip .chip-caret { font-size: 9px; color: var(--muted); margin-left: -1px; }
+.launcher-chip.chip-drop-into { outline: 2px dashed var(--accent); outline-offset: 1px; background: #283041; }
+
+/* a chip being dragged across containers (out of / into a category) */
+.launcher-chip.chip-ghost {
+  position: fixed; z-index: 3000; pointer-events: none;
+  opacity: 0.9; box-shadow: 0 4px 14px rgba(0,0,0,0.5);
+}
+
+/* category popup: commands shown as colored chips, sized to their name (like the bar) */
+.cat-menu .cat-children { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; padding: 3px 2px; max-height: 52vh; overflow-y: auto; max-width: 100%; }
+.cat-child-chip { max-width: 100%; }
+.cat-child-chip .chip-label { overflow: hidden; text-overflow: ellipsis; }
+.cat-child-chip .chip-del { opacity: 0.55; }
+.cat-child-chip:hover .chip-del { opacity: 1; }
+.launcher-bar.bar-drop-active { box-shadow: inset 0 0 0 1px var(--accent); }
 .launcher-chip .chip-del {
   font-size: 10px;
   color: var(--muted);
@@ -737,6 +754,25 @@ body.dragging #webview-layer webview { pointer-events: none; }
   outline: none;
 }
 .modal input[type="text"]:focus { border-color: var(--accent); }
+.modal .m-seg {
+  display: flex; gap: 0; margin-bottom: 14px;
+  border: 1px solid var(--border); border-radius: 7px; overflow: hidden;
+}
+.modal .m-seg-btn {
+  flex: 1 1 0; padding: 7px 0; font-size: 12px;
+  background: var(--bg); color: var(--muted);
+  border: none; border-right: 1px solid var(--border); cursor: pointer;
+}
+.modal .m-seg-btn:last-child { border-right: none; }
+.modal .m-seg-btn:hover { color: var(--text); }
+.modal .m-seg-btn.active { background: var(--accent); color: #0d1117; font-weight: 600; }
+.modal select.m-cat {
+  display: block; width: 100%; margin-top: 4px;
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 7px 9px; font-size: 13px; outline: none; cursor: pointer;
+}
+.modal select.m-cat:focus { border-color: var(--accent); }
 .modal .m-row { display: flex; gap: 6px; align-items: stretch; margin-top: 4px; }
 .modal .m-row input { margin-top: 0; }
 .modal .m-pick {

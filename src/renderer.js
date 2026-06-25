@@ -121,10 +121,18 @@ const overlay = document.getElementById('overlay');
 
 // ---------------- global command launchers ----------------
 // Reusable buttons shown in every pane. Clicking runs in THAT pane.
-// { id, name, cwd, command, color }
+// Two kinds of top-level item:
+//   command  -> { id, type:'command', name, cwd, command, color }
+//   category -> { id, type:'category', name, color, children:[ {id,name,cwd,command,color}... ] }
+// A category chip opens a popup listing its commands (for organizing buttons).
 function loadLaunchers() {
-  try { return JSON.parse(localStorage.getItem('termi.launchers') || '[]'); }
-  catch { return []; }
+  try {
+    const arr = JSON.parse(localStorage.getItem('termi.launchers') || '[]');
+    // migrate older entries (no `type`) -> plain commands
+    return arr.map((l) => (l && l.type === 'category')
+      ? { ...l, type: 'category', children: Array.isArray(l.children) ? l.children : [] }
+      : { ...l, type: 'command' });
+  } catch { return []; }
 }
 function saveLaunchers() {
   localStorage.setItem('termi.launchers', JSON.stringify(launchers));
@@ -158,6 +166,11 @@ function deleteLauncher(id) {
   launchers = launchers.filter((l) => l.id !== id);
   saveLaunchers();
   render();
+}
+
+function pointInRect(ev, el) {
+  const r = el.getBoundingClientRect();
+  return ev.clientX >= r.left && ev.clientX <= r.right && ev.clientY >= r.top && ev.clientY <= r.bottom;
 }
 
 // ---------------- terminal view cache ----------------
@@ -1135,7 +1148,7 @@ function renderPane(leaf) {
   } else {
     const launcherBtn = document.createElement('button');
     launcherBtn.textContent = '⚡';
-    launcherBtn.title = 'Νέο κουμπί εντολής';
+    launcherBtn.title = 'Νέο κουμπί / κατηγορία';
     launcherBtn.addEventListener('click', (e) => { e.stopPropagation(); openLauncherModal(); });
 
     const folderBtn = document.createElement('button');
@@ -1177,25 +1190,36 @@ function renderLauncherBar(leaf) {
   lb.className = 'launcher-bar';
   launchers.forEach((L) => {
     const chip = document.createElement('button');
-    chip.className = 'launcher-chip';
+    chip.className = 'launcher-chip' + (L.type === 'category' ? ' chip-category' : '');
     chip.dataset.lid = L.id;
     chip.style.borderColor = L.color || 'var(--border)';
-    const tip = [];
-    if (L.cwd) tip.push('📁 ' + L.cwd);
-    if (L.command) tip.push('▸ ' + L.command);
-    chip.title = tip.join('\n');
 
     const label = document.createElement('span');
     label.className = 'chip-label';
     label.textContent = L.name;
+
     const del = document.createElement('span');
     del.className = 'chip-del';
     del.textContent = '✕';
     del.title = 'Διαγραφή κουμπιού';
     del.addEventListener('click', (e) => { e.stopPropagation(); deleteLauncher(L.id); });
 
-    chip.append(label, del);
+    if (L.type === 'category') {
+      chip.title = 'Κατηγορία: ' + L.name + ` (${(L.children || []).length})`;
+      const caret = document.createElement('span');
+      caret.className = 'chip-caret';
+      caret.textContent = '▾';
+      chip.append(label, caret, del);
+    } else {
+      const tip = [];
+      if (L.cwd) tip.push('📁 ' + L.cwd);
+      if (L.command) tip.push('▸ ' + L.command);
+      chip.title = tip.join('\n');
+      chip.append(label, del);
+    }
+
     // pointerdown -> potential drag-to-reorder; a plain click (no drag) runs it
+    // (or, for a category, opens its popup)
     chip.addEventListener('pointerdown', (e) => startChipDrag(e, L, leaf.id, chip, lb));
     lb.appendChild(chip);
   });
@@ -1207,6 +1231,12 @@ function startChipDrag(e, L, paneId, chip, bar) {
   if (e.target.closest('.chip-del')) return; // let delete handle it
   const startX = e.clientX, startY = e.clientY;
   let dragging = false;
+  let dropCatEl = null; // a category chip currently targeted as "drop into"
+
+  function clearDropCat() {
+    if (dropCatEl) dropCatEl.classList.remove('chip-drop-into');
+    dropCatEl = null;
+  }
 
   function move(ev) {
     if (!dragging) {
@@ -1214,6 +1244,17 @@ function startChipDrag(e, L, paneId, chip, bar) {
       dragging = true;
       chip.classList.add('chip-dragging');
     }
+    // a plain command can be dropped INTO a category chip (not another category)
+    if (L.type === 'command') {
+      const overCat = [...bar.querySelectorAll('.launcher-chip.chip-category')]
+        .find((c) => c !== chip && pointInRect(ev, c));
+      if (overCat) {
+        if (overCat !== dropCatEl) { clearDropCat(); dropCatEl = overCat; dropCatEl.classList.add('chip-drop-into'); }
+        return; // targeting a category -> skip reorder
+      }
+    }
+    clearDropCat();
+    // otherwise: live reorder within the bar (unchanged behavior)
     const siblings = [...bar.querySelectorAll('.launcher-chip:not(.chip-dragging)')];
     let next = null;
     for (const s of siblings) {
@@ -1227,11 +1268,134 @@ function startChipDrag(e, L, paneId, chip, bar) {
     window.removeEventListener('pointermove', move);
     window.removeEventListener('pointerup', up);
     chip.classList.remove('chip-dragging');
-    if (!dragging) { runLauncher(L, paneId); return; }
+    if (!dragging) {
+      clearDropCat();
+      if (L.type === 'category') openCategoryMenu(L, paneId, chip);
+      else runLauncher(L, paneId);
+      return;
+    }
+    // dropped onto a category -> move this top-level command inside it
+    if (dropCatEl) {
+      const catId = dropCatEl.dataset.lid;
+      clearDropCat();
+      const cat = launchers.find((l) => l.id === catId && l.type === 'category');
+      if (cat && cat.id !== L.id) {
+        launchers = launchers.filter((l) => l.id !== L.id);
+        cat.children = cat.children || [];
+        const { type, ...cmd } = L; // store children without the top-level `type`
+        cat.children.push(cmd);
+        saveLaunchers();
+        render();
+        return;
+      }
+    }
+    clearDropCat();
+    // commit the reorder
     const order = [...bar.querySelectorAll('.launcher-chip')].map((c) => c.dataset.lid);
     launchers.sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
     saveLaunchers();
     render();
+  }
+  window.addEventListener('pointermove', move);
+  window.addEventListener('pointerup', up);
+}
+
+// Drag a command OUT of a category popup: drop on the bar -> becomes a top-level
+// chip; drop on another category chip -> moves between categories; a plain click runs it.
+function startCatChildDrag(e, cat, child, chipEl, paneId, anchor, close) {
+  if (e.button !== 0) return;
+  if (e.target.closest('.chip-del')) return; // let delete handle it
+  const startX = e.clientX, startY = e.clientY;
+  const bar = anchor.closest('.launcher-bar');
+  const list = chipEl.closest('.cat-children');
+  let dragging = false;
+  let ghost = null;
+  let dropCatEl = null;
+
+  function clearHL() {
+    if (dropCatEl) dropCatEl.classList.remove('chip-drop-into');
+    dropCatEl = null;
+    if (bar) bar.classList.remove('bar-drop-active');
+  }
+  function move(ev) {
+    if (!dragging) {
+      if (Math.hypot(ev.clientX - startX, ev.clientY - startY) < 5) return;
+      dragging = true;
+      const r0 = chipEl.getBoundingClientRect();
+      chipEl.classList.add('chip-dragging');
+      ghost = chipEl.cloneNode(true);
+      ghost.querySelectorAll('.chip-del').forEach((d) => d.remove());
+      ghost.classList.add('chip-ghost');
+      // keep the dragged chip its real size (the popup chip is width:100% -> would
+      // otherwise stretch the fixed-position ghost to the full screen width)
+      ghost.style.width = r0.width + 'px';
+      document.body.appendChild(ghost);
+    }
+    ghost.style.left = (ev.clientX + 10) + 'px';
+    ghost.style.top = (ev.clientY + 10) + 'px';
+    clearHL();
+    // over another category chip in the bar? -> move between categories
+    if (bar) {
+      const overCat = [...bar.querySelectorAll('.launcher-chip.chip-category')]
+        .find((c) => c.dataset.lid !== cat.id && pointInRect(ev, c));
+      if (overCat) { dropCatEl = overCat; dropCatEl.classList.add('chip-drop-into'); return; }
+    }
+    // inside the popup list -> live reorder among the category's commands
+    if (list && pointInRect(ev, list)) {
+      const sibs = [...list.querySelectorAll('.cat-child-chip:not(.chip-dragging)')];
+      let next = null;
+      for (const s of sibs) {
+        const r = s.getBoundingClientRect();
+        if (ev.clientY < r.top + r.height / 2) { next = s; break; }
+      }
+      if (next) list.insertBefore(chipEl, next);
+      else list.appendChild(chipEl);
+      return;
+    }
+    // over the bar in general -> will drop out to top level
+    if (bar && pointInRect(ev, bar)) bar.classList.add('bar-drop-active');
+  }
+  function up(ev) {
+    window.removeEventListener('pointermove', move);
+    window.removeEventListener('pointerup', up);
+    if (ghost) ghost.remove();
+    chipEl.classList.remove('chip-dragging');
+    if (!dragging) { clearHL(); close(); runLauncher(child, paneId); return; }
+
+    const destCatId = dropCatEl ? dropCatEl.dataset.lid : null;
+    const overBar = bar && pointInRect(ev, bar);
+    clearHL();
+
+    if (destCatId) {
+      // move into another category
+      cat.children = (cat.children || []).filter((x) => x.id !== child.id);
+      const dest = launchers.find((l) => l.id === destCatId && l.type === 'category');
+      if (dest) { dest.children = dest.children || []; dest.children.push(child); }
+      saveLaunchers(); close(); render(); return;
+    }
+    if (overBar) {
+      // pop out to the top-level bar, inserted at the drop position
+      cat.children = (cat.children || []).filter((x) => x.id !== child.id);
+      const chips = [...bar.querySelectorAll('.launcher-chip')];
+      let insertIdx = launchers.length;
+      for (const c of chips) {
+        const r = c.getBoundingClientRect();
+        if (ev.clientX < r.left + r.width / 2) {
+          const idx = launchers.findIndex((l) => l.id === c.dataset.lid);
+          if (idx >= 0) { insertIdx = idx; break; }
+        }
+      }
+      launchers.splice(insertIdx, 0, { ...child, type: 'command' });
+      saveLaunchers(); close(); render(); return;
+    }
+    if (list && pointInRect(ev, list)) {
+      // reorder within the category, following the live DOM order
+      const order = [...list.querySelectorAll('.cat-child-chip')].map((c) => c.dataset.lid);
+      cat.children.sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
+      saveLaunchers(); close(); openCategoryMenu(cat, paneId, anchor); return;
+    }
+    // dropped nowhere useful -> keep the popup open, unchanged
+    close(); openCategoryMenu(cat, paneId, anchor);
   }
   window.addEventListener('pointermove', move);
   window.addEventListener('pointerup', up);
@@ -1402,26 +1566,110 @@ function performDrop(dragged, targetId, zone) {
   render();
 }
 
-// ---------------- launcher creation modal ----------------
+// ---------------- category popup (lists a category's commands) ----------------
+// Anchored to a category chip: click a command to run it in this pane, ✕ to remove,
+// or "＋ Προσθήκη εντολής" to add a new command straight into this category.
+function openCategoryMenu(L, paneId, anchor) {
+  document.querySelectorAll('.browser-menu').forEach((m) => m.remove());
+  const menu = document.createElement('div');
+  menu.className = 'browser-menu cat-menu';
 
-function openLauncherModal() {
+  const children = L.children || (L.children = []);
+  if (!children.length) {
+    const empty = document.createElement('div');
+    empty.className = 'bm-head';
+    empty.textContent = 'Κενή κατηγορία — σύρε εδώ ένα κουμπί ή πρόσθεσε εντολή';
+    menu.appendChild(empty);
+  }
+  const list = document.createElement('div');
+  list.className = 'cat-children';
+  children.forEach((c) => {
+    // commands render as colored chips (like the bar) and are draggable in/out
+    const chip = document.createElement('button');
+    chip.className = 'launcher-chip cat-child-chip';
+    chip.dataset.lid = c.id;
+    chip.style.borderColor = c.color || 'var(--border)';
+    const tip = [];
+    if (c.cwd) tip.push('📁 ' + c.cwd);
+    if (c.command) tip.push('▸ ' + c.command);
+    chip.title = tip.join('\n');
+
+    const label = document.createElement('span');
+    label.className = 'chip-label';
+    label.textContent = c.name;
+    const del = document.createElement('span');
+    del.className = 'chip-del';
+    del.textContent = '✕';
+    del.title = 'Διαγραφή εντολής';
+    del.addEventListener('click', (e) => {
+      e.stopPropagation();
+      L.children = children.filter((x) => x.id !== c.id);
+      saveLaunchers();
+      close();
+      render();
+      openCategoryMenu(L, paneId, anchor);
+    });
+    chip.append(label, del);
+    // pointerdown -> potential drag (out to bar / to another category); a plain click runs it
+    chip.addEventListener('pointerdown', (e) => startCatChildDrag(e, L, c, chip, paneId, anchor, close));
+    list.appendChild(chip);
+  });
+  menu.appendChild(list);
+
+  const sep = document.createElement('div'); sep.className = 'bm-sep'; menu.appendChild(sep);
+  const add = document.createElement('div');
+  add.className = 'bm-item bm-add';
+  add.innerHTML = `<i class="codicon codicon-add"></i><span class="bm-label">Προσθήκη εντολής…</span>`;
+  add.addEventListener('click', (e) => { e.stopPropagation(); close(); openLauncherModal({ categoryId: L.id }); });
+  menu.appendChild(add);
+
+  document.body.appendChild(menu);
+  const r = anchor.getBoundingClientRect();
+  menu.style.left = Math.min(r.left, window.innerWidth - menu.offsetWidth - 8) + 'px';
+  menu.style.top = (r.bottom + 4) + 'px';
+
+  function close() { menu.remove(); document.removeEventListener('pointerdown', outside, true); window.removeEventListener('keydown', esc, true); }
+  function outside(e) { if (!menu.contains(e.target) && e.target !== anchor) close(); }
+  function esc(e) { if (e.key === 'Escape') close(); }
+  setTimeout(() => { document.addEventListener('pointerdown', outside, true); window.addEventListener('keydown', esc, true); }, 0);
+}
+
+// ---------------- launcher creation modal ----------------
+// opts.categoryId (optional): create a command straight inside that category.
+function openLauncherModal(opts = {}) {
   const backdrop = document.createElement('div');
   backdrop.className = 'modal-backdrop';
+
+  const intoCat = opts.categoryId
+    ? launchers.find((l) => l.type === 'category' && l.id === opts.categoryId)
+    : null;
+  const cats = launchers.filter((l) => l.type === 'category');
 
   const modal = document.createElement('div');
   modal.className = 'modal';
   modal.innerHTML = `
-    <h3>Νέο κουμπί εντολής</h3>
+    <h3>${intoCat ? 'Νέα εντολή στην κατηγορία «' + intoCat.name + '»' : 'Νέο κουμπί'}</h3>
+    <div class="m-seg" ${intoCat ? 'style="display:none"' : ''}>
+      <button type="button" class="m-seg-btn active" data-type="command">Εντολή</button>
+      <button type="button" class="m-seg-btn" data-type="category">Κατηγορία</button>
+    </div>
     <label>Όνομα<input type="text" class="m-name" placeholder="π.χ. Project / Build" spellcheck="false"></label>
-    <label>Διαδρομή (προαιρετική)
+    <label class="m-cat-row" ${intoCat || !cats.length ? 'style="display:none"' : ''}>Κατηγορία
+      <select class="m-cat">
+        <option value="">(Καμία — στη μπάρα)</option>
+        ${cats.map((c) => `<option value="${c.id}">${c.name}</option>`).join('')}
+      </select>
+    </label>
+    <label class="m-cwd-row">Διαδρομή (προαιρετική)
       <span class="m-row">
         <input type="text" class="m-cwd" placeholder="C:\\..." spellcheck="false">
         <button type="button" class="m-pick" title="Επιλογή φακέλου">📁</button>
       </span>
     </label>
-    <label>Εντολή (προαιρετική)<input type="text" class="m-cmd" placeholder="π.χ. npm run dev" spellcheck="false"></label>
+    <label class="m-cmd-row">Εντολή (προαιρετική)<input type="text" class="m-cmd" placeholder="π.χ. npm run dev" spellcheck="false"></label>
     <label class="m-color-row">Χρώμα<input type="color" class="m-color" value="#58a6ff"></label>
-    <div class="m-hint">Άφησε την εντολή κενή για κουμπί μόνο-διαδρομής (κάνει <code>cd</code>).</div>
+    <div class="m-hint m-hint-cmd">Άφησε την εντολή κενή για κουμπί μόνο-διαδρομής (κάνει <code>cd</code>).</div>
+    <div class="m-hint m-hint-cat" style="display:none">Η κατηγορία είναι ένα κουμπί που ανοίγει pop-up με τις εντολές σου.</div>
     <div class="m-actions">
       <button type="button" class="m-cancel">Άκυρο</button>
       <button type="button" class="m-save">Αποθήκευση</button>
@@ -1435,6 +1683,29 @@ function openLauncherModal() {
   const cwdI = modal.querySelector('.m-cwd');
   const cmdI = modal.querySelector('.m-cmd');
   const colorI = modal.querySelector('.m-color');
+  const catSel = modal.querySelector('.m-cat');
+  if (intoCat) catSel.value = intoCat.id;
+
+  // type toggle (Εντολή / Κατηγορία) — categories only need name + color
+  let kind = 'command';
+  const cmdOnlyRows = ['.m-cat-row', '.m-cwd-row', '.m-cmd-row', '.m-hint-cmd'];
+  function setKind(k) {
+    kind = k;
+    modal.querySelectorAll('.m-seg-btn').forEach((b) => b.classList.toggle('active', b.dataset.type === k));
+    const isCmd = k === 'command';
+    cmdOnlyRows.forEach((sel) => {
+      const el = modal.querySelector(sel);
+      if (!el) return;
+      // keep the category dropdown hidden when there are no categories to pick
+      if (sel === '.m-cat-row' && (!cats.length || intoCat)) { el.style.display = 'none'; return; }
+      el.style.display = isCmd ? '' : 'none';
+    });
+    modal.querySelector('.m-hint-cat').style.display = isCmd ? 'none' : '';
+  }
+  modal.querySelectorAll('.m-seg-btn').forEach((b) => {
+    b.addEventListener('click', () => setKind(b.dataset.type));
+  });
+
   nameI.focus();
 
   function close() { backdrop.remove(); }
@@ -1451,11 +1722,28 @@ function openLauncherModal() {
 
   function save() {
     const name = nameI.value.trim();
+    if (!name) { nameI.focus(); return; }
+
+    if (kind === 'category') {
+      launchers.push({ id: 'l' + Date.now(), type: 'category', name, color: colorI.value, children: [] });
+      saveLaunchers();
+      close();
+      render();
+      return;
+    }
+
     const cwd = cwdI.value.trim();
     const command = cmdI.value.trim();
-    if (!name) { nameI.focus(); return; }
     if (!cwd && !command) { cwdI.focus(); return; }
-    launchers.push({ id: 'l' + Date.now(), name, cwd, command, color: colorI.value });
+    const cmd = { id: 'l' + Date.now(), name, cwd, command, color: colorI.value };
+    const targetId = intoCat ? intoCat.id : catSel.value;
+    const cat = targetId && launchers.find((l) => l.type === 'category' && l.id === targetId);
+    if (cat) {
+      cat.children = cat.children || [];
+      cat.children.push(cmd);
+    } else {
+      launchers.push({ ...cmd, type: 'command' });
+    }
     saveLaunchers();
     close();
     render();
