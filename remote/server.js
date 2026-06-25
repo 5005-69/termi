@@ -36,6 +36,11 @@ const SRC_DIR = path.join(PROJECT_DIR, 'src');
 const NODE_MODULES = path.join(PROJECT_DIR, 'node_modules');
 
 const MAX_LOGIN_ATTEMPTS = 8;
+// Keep a disconnected session's terminals alive this long, so a phone whose tab was
+// backgrounded (mobile browsers kill the socket fast) can silently resume its work.
+const GRACE_MS = 6 * 60 * 60 * 1000;      // 6 hours
+const HEARTBEAT_MS = 30000;               // ping clients to spot dead sockets
+const MAX_BUFFER = 2 * 1024 * 1024;       // cap output buffered for a detached session
 const DEFAULT_SHELL = process.platform === 'win32'
   ? (process.env.COMSPEC && /powershell/i.test(process.env.COMSPEC) ? process.env.COMSPEC : 'powershell.exe')
   : (process.env.SHELL || 'bash');
@@ -50,13 +55,17 @@ let state = null;
 function randToken() { return crypto.randomBytes(24).toString('base64url'); }
 function randPin() { return String(crypto.randomInt(0, 1000000)).padStart(6, '0'); }
 function sign(v, s) { return crypto.createHmac('sha256', s).update(v).digest('base64url'); }
-function makeSessionCookie(s) { const b = 'ok.' + Date.now(); return b + '.' + sign(b, s); }
+// The cookie carries a stable session id (base64url, no dots) so reconnects from the
+// same phone reattach to the same terminals: `<sid>.<ts>.<sig>`.
+function makeSessionCookie(s, sid) { const b = sid + '.' + Date.now(); return b + '.' + sign(b, s); }
+// returns the session id on success, or null
 function verifySessionCookie(raw, s) {
-  if (!raw) return false;
+  if (!raw) return null;
   const p = String(raw).split('.');
-  if (p.length !== 3) return false;
-  try { return crypto.timingSafeEqual(Buffer.from(p[2]), Buffer.from(sign(p[0] + '.' + p[1], s))); }
-  catch { return false; }
+  if (p.length !== 3) return null;
+  try { if (crypto.timingSafeEqual(Buffer.from(p[2]), Buffer.from(sign(p[0] + '.' + p[1], s)))) return p[0]; }
+  catch { return null; }
+  return null;
 }
 function parseCookies(h) {
   const out = {};
@@ -156,24 +165,30 @@ async function listDir(dir) {
 
 // ---------------- per-client RPC ----------------
 
-async function handleRpc(client, op, args) {
+async function handleRpc(session, op, args) {
   const a = args || {};
   switch (op) {
-    // ----- pty (this client's own sessions) -----
+    // ----- pty (this session's own terminals) -----
     case 'spawn': {
       if (!state.control) return;
-      if (client.ptys.has(a.id)) return;
+      if (session.ptys.has(a.id)) return;
       let cwd = a.cwd;
       try { if (!cwd || !fs.existsSync(cwd)) cwd = os.homedir(); } catch { cwd = os.homedir(); }
       const proc = pty.spawn(DEFAULT_SHELL, [], { name: 'xterm-color', cols: a.cols || 80, rows: a.rows || 24, cwd, env: process.env });
-      client.ptys.set(a.id, proc);
-      proc.onData((data) => { if (client.ws.readyState === 1) client.ws.send(JSON.stringify({ event: 'pty:data', id: a.id, data })); });
-      proc.onExit(({ exitCode }) => { client.ptys.delete(a.id); if (client.ws.readyState === 1) client.ws.send(JSON.stringify({ event: 'pty:exit', id: a.id, exitCode })); });
+      session.ptys.set(a.id, proc);
+      proc.onData((data) => {
+        if (session.ws && session.ws.readyState === 1) session.ws.send(JSON.stringify({ event: 'pty:data', id: a.id, data }));
+        else bufferPty(session, a.id, data);    // phone away -> keep output for resume
+      });
+      proc.onExit(({ exitCode }) => {
+        session.ptys.delete(a.id); session.buffers.delete(a.id);
+        if (session.ws && session.ws.readyState === 1) session.ws.send(JSON.stringify({ event: 'pty:exit', id: a.id, exitCode }));
+      });
       return;
     }
-    case 'write': { if (!state.control) return; const p = client.ptys.get(a.id); if (p) p.write(a.data); return; }
-    case 'resize': { const p = client.ptys.get(a.id); if (p && a.cols > 0 && a.rows > 0) { try { p.resize(a.cols, a.rows); } catch { /* */ } } return; }
-    case 'kill': { const p = client.ptys.get(a.id); if (p) { try { p.kill(); } catch { /* */ } client.ptys.delete(a.id); } return; }
+    case 'write': { if (!state.control) return; const p = session.ptys.get(a.id); if (p) p.write(a.data); return; }
+    case 'resize': { const p = session.ptys.get(a.id); if (p && a.cols > 0 && a.rows > 0) { try { p.resize(a.cols, a.rows); } catch { /* */ } } return; }
+    case 'kill': { const p = session.ptys.get(a.id); if (p) { try { p.kill(); } catch { /* */ } session.ptys.delete(a.id); session.buffers.delete(a.id); } return; }
 
     // ----- filesystem -----
     case 'home': return os.homedir();
@@ -191,7 +206,7 @@ async function handleRpc(client, op, args) {
       if (exists) throw new Error('Υπάρχει ήδη στοιχείο με αυτό το όνομα στον προορισμό');
       await fsp.rename(a.src, target);
     });
-    case 'watchDir': watchForClient(client, a.dir); return;
+    case 'watchDir': watchForSession(session, a.dir); return;
 
     // ----- git -----
     case 'gitStatus': return doOp(async () => {
@@ -215,25 +230,50 @@ async function handleRpc(client, op, args) {
   }
 }
 
-function watchForClient(client, dir) {
-  if (dir === client.watchDir) return;
-  if (client.watcher) { try { client.watcher.close(); } catch { /* */ } client.watcher = null; }
-  client.watchDir = dir || null;
+function watchForSession(session, dir) {
+  if (dir === session.watchDir) return;
+  if (session.watcher) { try { session.watcher.close(); } catch { /* */ } session.watcher = null; }
+  session.watchDir = dir || null;
   if (!dir) return;
   try {
-    client.watcher = fs.watch(dir, { recursive: true }, () => {
-      clearTimeout(client.watchTimer);
-      client.watchTimer = setTimeout(() => { if (client.ws.readyState === 1) client.ws.send(JSON.stringify({ event: 'fs:changed' })); }, 250);
+    session.watcher = fs.watch(dir, { recursive: true }, () => {
+      clearTimeout(session.watchTimer);
+      session.watchTimer = setTimeout(() => { if (session.ws && session.ws.readyState === 1) session.ws.send(JSON.stringify({ event: 'fs:changed' })); }, 250);
     });
-    client.watcher.on('error', () => { try { client.watcher.close(); } catch { /* */ } client.watcher = null; });
+    session.watcher.on('error', () => { try { session.watcher.close(); } catch { /* */ } session.watcher = null; });
   } catch { /* */ }
 }
 
-function cleanupClient(client) {
-  for (const p of client.ptys.values()) { try { p.kill(); } catch { /* */ } }
-  client.ptys.clear();
-  if (client.watcher) { try { client.watcher.close(); } catch { /* */ } client.watcher = null; }
-  state && state.clients.delete(client);
+// Output that arrives while the phone is away is buffered (capped, oldest dropped) and
+// replayed in order when it reconnects, so the terminal picks up exactly where it left.
+function bufferPty(session, id, data) {
+  let arr = session.buffers.get(id);
+  if (!arr) { arr = []; session.buffers.set(id, arr); }
+  arr.push(data); session.bufBytes += data.length;
+  while (session.bufBytes > MAX_BUFFER) {
+    let dropped = false;
+    for (const a2 of session.buffers.values()) { if (a2.length) { session.bufBytes -= a2.shift().length; dropped = true; break; } }
+    if (!dropped) break;
+  }
+}
+
+// A socket dropped (backgrounded tab / network blip). Keep this session's terminals and
+// their output alive for the grace window so the phone can silently resume; only really
+// tear down if the user stays away past it.
+function detachSession(session, ws) {
+  if (session.ws && session.ws !== ws) return;   // a newer socket already took over
+  session.ws = null;
+  if (session.graceTimer) clearTimeout(session.graceTimer);
+  session.graceTimer = setTimeout(() => destroySession(session), GRACE_MS);
+}
+
+function destroySession(session) {
+  if (session.graceTimer) { clearTimeout(session.graceTimer); session.graceTimer = null; }
+  for (const p of session.ptys.values()) { try { p.kill(); } catch { /* */ } }
+  session.ptys.clear();
+  if (session.watcher) { try { session.watcher.close(); } catch { /* */ } session.watcher = null; }
+  session.buffers.clear(); session.bufBytes = 0;
+  state && state.sessions.delete(session.id);
 }
 
 // ---------------- open / close ----------------
@@ -248,7 +288,7 @@ async function open(ctx) {
   const secret = crypto.randomBytes(32);
   state = {
     token, pin, secret, control: ctx.controlEnabled !== false,
-    clients: new Set(), loginAttempts: 0,
+    sessions: new Map(), loginAttempts: 0, heartbeat: null,
     server: null, wss: null, tunnel: null, port: 0, url: '',
   };
 
@@ -279,8 +319,9 @@ async function open(ctx) {
       const tokOk = typeof parsed.token === 'string' && parsed.token.length === token.length && crypto.timingSafeEqual(Buffer.from(parsed.token), Buffer.from(token));
       const pinOk = typeof parsed.pin === 'string' && parsed.pin.length === pin.length && crypto.timingSafeEqual(Buffer.from(parsed.pin), Buffer.from(pin));
       if (tokOk && pinOk) {
-        const cookie = makeSessionCookie(secret);
-        res.writeHead(200, { 'Content-Type': 'application/json', 'Set-Cookie': `termi_sess=${encodeURIComponent(cookie)}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400` });
+        const sid = randToken();
+        const cookie = makeSessionCookie(secret, sid);
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Set-Cookie': `termi_sess=${encodeURIComponent(cookie)}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=604800` });
         return res.end(JSON.stringify({ ok: true, control: state.control }));
       }
       state.loginAttempts++;
@@ -294,32 +335,62 @@ async function open(ctx) {
   const wss = new WebSocketServer({ noServer: true });
   server.on('upgrade', (req, socket, head) => {
     if (new URL(req.url, 'http://localhost').pathname !== '/ws') { socket.destroy(); return; }
-    if (!verifySessionCookie(parseCookies(req.headers.cookie).termi_sess, secret)) { socket.destroy(); return; }
-    wss.handleUpgrade(req, socket, head, (ws) => onConnection(ws));
+    const sid = verifySessionCookie(parseCookies(req.headers.cookie).termi_sess, secret);
+    if (!sid) { socket.destroy(); return; }
+    wss.handleUpgrade(req, socket, head, (ws) => onConnection(ws, sid));
   });
 
-  function onConnection(ws) {
-    const client = { ws, ptys: new Map(), watcher: null, watchDir: null, watchTimer: null };
-    state.clients.add(client);
-    ws.send(JSON.stringify({ event: 'ready', control: state.control }));
+  function onConnection(ws, sid) {
+    // find-or-create the session for this device; reconnects reattach to the same one
+    let session = state.sessions.get(sid);
+    if (!session) {
+      session = { id: sid, ws, ptys: new Map(), watcher: null, watchDir: null, watchTimer: null, buffers: new Map(), bufBytes: 0, graceTimer: null };
+      state.sessions.set(sid, session);
+    } else {
+      if (session.graceTimer) { clearTimeout(session.graceTimer); session.graceTimer = null; }
+      if (session.ws && session.ws !== ws) { try { session.ws.close(); } catch { /* */ } }  // drop a stale socket
+      session.ws = ws;
+    }
+    ws.isAlive = true;
+    ws.on('pong', () => { ws.isAlive = true; });
+
+    const resumed = session.ptys.size > 0;
+    ws.send(JSON.stringify({ event: 'ready', control: state.control, resumed }));
+    // replay output that arrived while the phone was away, in order, then nudge a refresh
+    for (const [id, chunks] of session.buffers) {
+      for (const data of chunks) { if (ws.readyState === 1) ws.send(JSON.stringify({ event: 'pty:data', id, data })); }
+    }
+    session.buffers.clear(); session.bufBytes = 0;
+    if (resumed && ws.readyState === 1) ws.send(JSON.stringify({ event: 'fs:changed' }));
+
     ws.on('message', async (raw, isBinary) => {
       if (isBinary) return;
       let msg = {}; try { msg = JSON.parse(raw.toString()); } catch { return; }
       const { rid, op, args } = msg;
       if (!op) return;
       try {
-        const value = await handleRpc(client, op, args);
+        const value = await handleRpc(session, op, args);
         if (rid != null && ws.readyState === 1) ws.send(JSON.stringify({ rid, value }));
       } catch (err) {
         if (rid != null && ws.readyState === 1) ws.send(JSON.stringify({ rid, error: String((err && err.message) || err) }));
       }
     });
-    ws.on('close', () => cleanupClient(client));
-    ws.on('error', () => cleanupClient(client));
+    ws.on('close', () => detachSession(session, ws));
+    ws.on('error', () => detachSession(session, ws));
   }
 
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
   state.server = server; state.wss = wss; state.port = server.address().port;
+
+  // Spot dead sockets (a frozen/backgrounded tab won't answer) and drop them, which
+  // starts the grace timer instead of killing the terminals outright.
+  state.heartbeat = setInterval(() => {
+    for (const s of state.sessions.values()) {
+      const ws = s.ws; if (!ws) continue;
+      if (ws.isAlive === false) { try { ws.terminate(); } catch { /* */ } continue; }
+      ws.isAlive = false; try { ws.ping(); } catch { /* */ }
+    }
+  }, HEARTBEAT_MS);
 
   const bin = await tunnel.ensureBinary(ctx.userDataDir, ctx.onProgress);
   const t = await tunnel.start(bin, state.port, { onLog: ctx.onLog });
@@ -336,12 +407,14 @@ async function open(ctx) {
 
 function status() {
   if (!state) return { open: false };
-  return { open: true, url: state.url, fullUrl: `${state.url}/#t=${state.token}`, pin: state.pin, clients: state.clients.size, control: state.control };
+  const clients = [...state.sessions.values()].filter((s) => s.ws && s.ws.readyState === 1).length;
+  return { open: true, url: state.url, fullUrl: `${state.url}/#t=${state.token}`, pin: state.pin, clients, control: state.control };
 }
 
 function close() {
   if (!state) return { open: false };
-  try { for (const c of [...state.clients]) cleanupClient(c); } catch { /* */ }
+  try { if (state.heartbeat) clearInterval(state.heartbeat); } catch { /* */ }
+  try { for (const s of [...state.sessions.values()]) destroySession(s); } catch { /* */ }
   try { state.wss && state.wss.close(); } catch { /* */ }
   try { state.server && state.server.close(); } catch { /* */ }
   try { state.tunnel && state.tunnel.stop(); } catch { /* */ }

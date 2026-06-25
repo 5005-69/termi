@@ -93,12 +93,28 @@
     window.Terminal = Patched;
   })();
 
-  // ---------------- websocket events ----------------
+  // ---------------- websocket events (with silent auto-reconnect) ----------------
+  // Mobile browsers kill the socket the moment the tab is backgrounded. We keep the
+  // session cookie (valid for days) and the server keeps this session's terminals alive
+  // for hours, so we just reconnect silently when the tab comes back — no PIN, no lost
+  // work. The server replays any output that arrived while we were away.
+  let reconnectTimer = null, backoff = 500, manualClose = false, failStreak = 0, everAuthed = false;
+
   function connect() {
+    if (ws && (ws.readyState === 0 || ws.readyState === 1)) return;   // already (re)connecting
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    let opened = false;
     ws = new WebSocket(proto + '//' + location.host + '/ws');
-    ws.onopen = () => { authed = true; flush(); hideLogin(); };
-    ws.onclose = () => { authed = false; showLogin('Η σύνδεση έκλεισε. Σκάναρε ξανά ή βάλε PIN.'); };
+    ws.onopen = () => { opened = true; authed = true; everAuthed = true; backoff = 500; failStreak = 0; flush(); hideLogin(); hideReconnecting(); };
+    ws.onclose = () => {
+      authed = false; ws = null;
+      if (manualClose) return;
+      if (!opened) failStreak++;                  // never opened -> cookie expired or net down
+      if (failStreak >= 8) { showLogin(everAuthed ? 'Η σύνδεση έληξε. Σκάναρε ξανά ή βάλε PIN.' : null); return; }
+      showReconnecting();
+      scheduleReconnect();
+    };
+    ws.onerror = () => { try { ws && ws.close(); } catch (e) { /* */ } };
     ws.onmessage = (ev) => {
       let m = {}; try { m = JSON.parse(ev.data); } catch { return; }
       if (m.rid != null && pending.has(m.rid)) { const r = pending.get(m.rid); pending.delete(m.rid); r(m.error != null ? { ok: false, error: m.error } : m.value); return; }
@@ -108,6 +124,40 @@
       if (m.event === 'fs:changed') { fsCbs.forEach((cb) => cb()); return; }
     };
   }
+
+  function scheduleReconnect() {
+    if (reconnectTimer) return;
+    reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, backoff);
+    backoff = Math.min(Math.round(backoff * 1.7), 5000);
+  }
+
+  // Returning to the tab / regaining network -> reconnect now, don't wait out the backoff.
+  function kick() {
+    if (manualClose) return;
+    if (ws && (ws.readyState === 0 || ws.readyState === 1)) return;
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    backoff = 500;
+    connect();
+  }
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') kick(); });
+  window.addEventListener('online', kick);
+  window.addEventListener('focus', kick);
+  window.addEventListener('pageshow', kick);
+
+  // ---------------- tiny non-blocking "reconnecting" pill (vs the full PIN overlay) ----------------
+  let recEl = null;
+  function showReconnecting() {
+    if (loginEl && loginEl.style.display !== 'none') return;   // PIN overlay already covers the screen
+    if (!recEl) {
+      recEl = document.createElement('div');
+      recEl.id = 'tb-reconnect';
+      recEl.textContent = 'Επανασύνδεση…';
+      recEl.style.cssText = 'position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:99999;background:rgba(20,20,22,.92);color:#eee;font:13px system-ui,sans-serif;padding:8px 14px;border-radius:20px;box-shadow:0 2px 10px rgba(0,0,0,.4);pointer-events:none;';
+      document.body.appendChild(recEl);
+    }
+    recEl.style.display = 'block';
+  }
+  function hideReconnecting() { if (recEl) recEl.style.display = 'none'; }
 
   // ---------------- login overlay ----------------
   let loginEl = null;
@@ -134,7 +184,7 @@
       try {
         const res = await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token, pin: v }) });
         const data = await res.json().catch(() => ({}));
-        if (res.ok && data.ok) { connect(); }
+        if (res.ok && data.ok) { failStreak = 0; backoff = 500; manualClose = false; connect(); }
         else if (res.status === 429) err.textContent = 'Πολλές αποτυχημένες προσπάθειες. Κλείσε & άνοιξε ξανά την πόρτα.';
         else err.textContent = 'Λάθος PIN' + (data.left != null ? ' (απομένουν ' + data.left + ')' : '');
       } catch { err.textContent = 'Σφάλμα σύνδεσης.'; }
@@ -377,7 +427,10 @@
     }, true);
   })();
 
-  // show login immediately (renderer renders behind it; its calls queue)
-  if (document.body) showLogin();
-  else document.addEventListener('DOMContentLoaded', showLogin);
+  // Show the PIN overlay, but also try to resume silently with an existing session
+  // cookie — a returning phone reconnects without re-entering the PIN. If there's no
+  // valid cookie the connect attempts fail quietly and the overlay stays put.
+  function boot() { showLogin(); connect(); }
+  if (document.body) boot();
+  else document.addEventListener('DOMContentLoaded', boot);
 })();
