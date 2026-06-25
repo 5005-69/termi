@@ -519,6 +519,31 @@ body.dragging #webview-layer webview { pointer-events: none; }
 .browser-menu .bm-item .bm-del:hover { opacity: 1; color: var(--accent); }
 .browser-menu .bm-sep { height: 1px; background: var(--border); margin: 4px 2px; }
 .browser-menu .bm-item.bm-add { color: var(--muted); }
+.browser-menu .bm-head { padding: 6px 9px 3px; font-size: 11px; color: var(--muted); }
+
+/* ---- detected-URL toast (offer to open a dev-server URL) ---- */
+.url-toast {
+  position: fixed; transform: translate(-50%, -100%);
+  z-index: 1500; max-width: 360px;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; box-shadow: 0 8px 28px rgba(0,0,0,.5);
+  padding: 9px 11px;
+}
+.url-toast .ut-msg { color: var(--text); font-size: 12px; margin-bottom: 8px; word-break: break-all; }
+.url-toast .ut-url { color: var(--accent); }
+.url-toast .ut-actions { display: flex; gap: 6px; align-items: center; }
+.url-toast .ut-actions button {
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 4px 10px; cursor: pointer; font-size: 12px;
+}
+.url-toast .ut-actions button:hover { border-color: var(--accent); }
+.url-toast .ut-actions .ut-x { margin-left: auto; padding: 4px 8px; color: var(--muted); }
+.url-toast .ut-remember {
+  display: flex; align-items: center; gap: 5px;
+  margin-top: 8px; color: var(--muted); font-size: 11px; cursor: pointer;
+}
+.url-toast .ut-remember input { margin: 0; }
 
 /* ---- Editor pane ---- */
 .pane-body.editor-body { padding: 0; background: #1e1e1e; }

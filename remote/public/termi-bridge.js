@@ -58,6 +58,8 @@
     clipboardWrite: (text) => fire('clipboardWrite', { text }),
     // dialogs -> custom in-browser folder picker (no native dialog on a phone)
     pickFolder: (current) => openFolderPicker(current),
+    // open externally -> a new browser tab (no native shell on a phone)
+    openExternal: (url) => { try { window.open(url, '_blank'); } catch (e) { /* */ } },
     // window controls -> browser equivalents / no-ops
     winMinimize: () => {},
     winMaximize: () => {},

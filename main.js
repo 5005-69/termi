@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, Menu, clipboard } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, Menu, clipboard, shell } = require('electron');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
@@ -215,6 +215,9 @@ ipcMain.handle('git:commit', (e, dir, message) => doOp(async () => {
 ipcMain.handle('git:push', (e, dir) => doOp(() => simpleGit(dir).push()));
 ipcMain.handle('git:pull', (e, dir) => doOp(() => simpleGit(dir).pull()));
 ipcMain.handle('git:init', (e, dir) => doOp(() => simpleGit(dir).init()));
+
+// open a URL in the user's default (native) browser
+ipcMain.handle('shell:openExternal', (e, url) => { try { shell.openExternal(url); } catch { /* */ } });
 
 ipcMain.handle('clipboard:read', () => clipboard.readText());
 ipcMain.on('clipboard:write', (e, text) => clipboard.writeText(text || ''));

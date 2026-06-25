@@ -52,6 +52,9 @@ contextBridge.exposeInMainWorld('termi', {
   // dialogs
   pickFolder: (current) => ipcRenderer.invoke('dialog:pickFolder', current),
 
+  // open a URL in the native default browser
+  openExternal: (url) => ipcRenderer.invoke('shell:openExternal', url),
+
   // app info
   appVersion: () => ipcRenderer.invoke('app:version'),
 

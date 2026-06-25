@@ -139,6 +139,15 @@ function loadWebApps() {
 function saveWebApps() { localStorage.setItem('termi.webapps', JSON.stringify(webApps)); }
 let webApps = loadWebApps();
 
+// What to do when a local (dev-server) URL is detected in terminal output:
+// 'ask' (prompt each time), 'pane' (always a browser pane), 'external' (native browser).
+function loadUrlAction() {
+  const v = localStorage.getItem('termi.urlAction');
+  return (v === 'pane' || v === 'external') ? v : 'ask';
+}
+function saveUrlAction() { localStorage.setItem('termi.urlAction', urlAction); }
+let urlAction = loadUrlAction();
+
 function runLauncher(L, paneId) {
   if (!views.get(paneId)) return;
   if (L.cwd) window.termi.write(paneId, ` cd "${L.cwd}"\r`);
@@ -365,12 +374,99 @@ function destroyView(id) {
 // pipe pty output -> xterm (registered once)
 window.termi.onData(({ id, data }) => {
   const v = views.get(id);
-  if (v && v.kind === 'terminal') v.term.write(data);
+  if (!v || v.kind !== 'terminal') return;
+  v.term.write(data);
+  if (!isRemote) detectLocalUrls(v, id, data);   // offer to open dev-server URLs
 });
 window.termi.onExit(({ id }) => {
   const v = views.get(id);
   if (v && v.kind === 'terminal') v.term.write('\r\n\x1b[90m[process exited]\x1b[0m\r\n');
 });
+
+// ---------------- detect local (dev-server) URLs in terminal output ----------------
+// When a dev server prints e.g. http://localhost:3000 we offer to open it (in a pane or
+// the native browser). Output arrives in ANSI-coloured chunks and a URL can split across
+// chunks, so we strip control codes and scan complete lines, carrying any partial line.
+const LOCAL_URL_RE = /https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d+)?(?:\/[^\s'"]*)?/gi;
+const handledUrls = new Set();   // a URL is prompted/opened at most once per session
+
+// Strip ANSI control sequences (no raw control bytes embedded in source).
+const ANSI_ESC = String.fromCharCode(27), ANSI_BEL = String.fromCharCode(7);
+function stripAnsi(s) {
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === ANSI_ESC) {
+      i++;
+      if (s[i] === '[') { i++; while (i < s.length && !/[@-~]/.test(s[i])) i++; }            // CSI .. final byte
+      else if (s[i] === ']') { i++; while (i < s.length && s[i] !== ANSI_BEL && s[i] !== ANSI_ESC) i++; } // OSC .. BEL/ESC
+      continue;
+    }
+    out += s[i];
+  }
+  return out;
+}
+
+function detectLocalUrls(v, id, data) {
+  const buf = (v.urlBuf || '') + stripAnsi(data);
+  const nl = buf.lastIndexOf('\n');
+  // only scan COMPLETE lines; carry the trailing partial line so a URL split across
+  // chunks isn't matched half-formed (e.g. ".../:80" before "00/app" arrives).
+  if (nl < 0) { v.urlBuf = buf.length > 2048 ? buf.slice(-2048) : buf; return; }
+  const scan = buf.slice(0, nl);
+  v.urlBuf = buf.slice(nl + 1);
+  if (v.urlBuf.length > 2048) v.urlBuf = v.urlBuf.slice(-2048);
+  let m;
+  LOCAL_URL_RE.lastIndex = 0;
+  while ((m = LOCAL_URL_RE.exec(scan))) {
+    const url = m[0].replace(/[).,;:'"]+$/, '');   // drop trailing punctuation
+    if (handledUrls.has(url)) continue;
+    handledUrls.add(url);
+    if (urlAction === 'pane') openLocalUrl(url, 'pane');
+    else if (urlAction === 'external') openLocalUrl(url, 'external');
+    else showUrlToast(id, url);
+  }
+}
+
+function openLocalUrl(url, action) {
+  if (action === 'external') window.termi.openExternal(url);
+  else openBrowserPane(url);
+}
+
+// Small toast anchored at the bottom of the originating pane, with the choice + a
+// "don't ask again" checkbox that remembers whichever action you pick.
+function showUrlToast(paneId, url) {
+  const pane = document.querySelector(`.pane[data-id="${paneId}"]`);
+  const toast = document.createElement('div');
+  toast.className = 'url-toast';
+  toast.innerHTML = `
+    <div class="ut-msg">Εντοπίστηκε <span class="ut-url"></span></div>
+    <div class="ut-actions">
+      <button class="ut-pane">Σε pane</button>
+      <button class="ut-ext">Σε browser</button>
+      <button class="ut-x" title="Κλείσιμο">✕</button>
+    </div>
+    <label class="ut-remember"><input type="checkbox"> Να μην ξαναρωτηθώ</label>`;
+  toast.querySelector('.ut-url').textContent = url;
+  document.body.appendChild(toast);
+
+  const offset = (document.querySelectorAll('.url-toast').length - 1) * 70;
+  const r = pane ? pane.getBoundingClientRect()
+                 : { left: 0, width: window.innerWidth, bottom: window.innerHeight };
+  toast.style.left = Math.round(r.left + r.width / 2) + 'px';
+  toast.style.top = Math.round(r.bottom - 14 - offset) + 'px';
+
+  const remember = toast.querySelector('.ut-remember input');
+  const timer = setTimeout(close, 15000);
+  function close() { clearTimeout(timer); toast.remove(); }
+  function choose(action) {
+    if (remember.checked) { urlAction = action; saveUrlAction(); }
+    close();
+    openLocalUrl(url, action);
+  }
+  toast.querySelector('.ut-pane').addEventListener('click', () => choose('pane'));
+  toast.querySelector('.ut-ext').addEventListener('click', () => choose('external'));
+  toast.querySelector('.ut-x').addEventListener('click', close);
+}
 
 // ---------------- web browser view (webview) ----------------
 // The <webview> guest reloads if it's detached/reattached in the DOM, but render()
@@ -1407,6 +1503,25 @@ function openBrowserMenu(anchor) {
   }
   sep();
   addItem('Προσθήκη εφαρμογής…', 'add', () => { close(); openWebAppModal({}); }, { cls: 'bm-add' });
+
+  // settings (in-panel, no extra popup): how detected local URLs should open
+  sep();
+  const hdr = document.createElement('div');
+  hdr.className = 'bm-head';
+  hdr.textContent = 'Τοπικά URL ανοίγουν:';
+  menu.appendChild(hdr);
+  const optLabels = { ask: 'Ερώτηση κάθε φορά', pane: 'Πάντα σε pane', external: 'Πάντα στον browser' };
+  ['ask', 'pane', 'external'].forEach((opt) => {
+    const it = addItem(optLabels[opt], urlAction === opt ? 'circle-filled' : 'circle-outline', () => {
+      urlAction = opt; saveUrlAction();
+      // repaint the three radios in place (no menu rebuild -> no listener churn)
+      menu.querySelectorAll('.bm-item[data-opt]').forEach((row) => {
+        const ic = row.querySelector('.codicon');
+        if (ic) ic.className = 'codicon codicon-' + (row.dataset.opt === urlAction ? 'circle-filled' : 'circle-outline');
+      });
+    });
+    it.dataset.opt = opt;
+  });
 
   document.body.appendChild(menu);
   const r = anchor.getBoundingClientRect();
