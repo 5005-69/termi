@@ -139,6 +139,121 @@ function saveLaunchers() {
 }
 let launchers = loadLaunchers();
 
+// ---- default "AI" category, seeded once (respecting the user's edits/deletions) ----
+// Ships pre-made: one category with ready install commands per AI coding agent,
+// three buttons each (Windows / macOS / Linux). Each default carries a stable
+// `seedId`. `termi.seededDefaults` is a map seedId -> the command we last seeded
+// (or `true` for the category). On every launch we:
+//   - add a button whose seedId was never offered (new tool / first run),
+//   - REFRESH a button's command when WE ship a corrected one, but ONLY if the user
+//     hasn't edited it (its current command still equals what we last seeded, or a
+//     known legacy default in LEGACY_DEFAULT_COMMANDS for older `true`-only records),
+//   - never touch a button the user edited, and never re-add one they deleted.
+// So a fix like "Codex Windows: irm -> npm" reaches existing installs automatically,
+// without clobbering anything the user changed.
+const LEGACY_DEFAULT_COMMANDS = {
+  // commands we shipped before and may now supersede; used to recognize an UNEDITED
+  // button when the stored record predates per-command tracking (with or without the
+  // later TLS prefix), so the corrected command reaches existing installs.
+  'codex-win': [
+    'irm https://chatgpt.com/codex/install.ps1 | iex',
+    '[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; irm https://chatgpt.com/codex/install.ps1 | iex',
+  ],
+  'claude-win': [
+    'irm https://claude.ai/install.ps1 | iex',
+    '[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; irm https://claude.ai/install.ps1 | iex',
+  ],
+  'antig-win': ['irm https://antigravity.google/cli/install.ps1 | iex'],
+};
+const SEED_AI_CATEGORY = { seedId: 'ai-cat', name: '🤖 AI', color: '#8957e5' };
+const SEED_AI_COMMANDS = [
+  // Claude Code (Anthropic)
+  { seedId: 'claude-win',   name: 'Claude · Windows', color: '#d97757', command: 'npm install -g @anthropic-ai/claude-code' },
+  { seedId: 'claude-mac',   name: 'Claude · macOS',   color: '#d97757', command: 'curl -fsSL https://claude.ai/install.sh | bash' },
+  { seedId: 'claude-linux', name: 'Claude · Linux',   color: '#d97757', command: 'curl -fsSL https://claude.ai/install.sh | bash' },
+  // Codex (OpenAI)
+  { seedId: 'codex-win',    name: 'Codex · Windows',  color: '#10a37f', command: 'npm install -g @openai/codex' },
+  { seedId: 'codex-mac',    name: 'Codex · macOS',    color: '#10a37f', command: 'curl -fsSL https://chatgpt.com/codex/install.sh | sh' },
+  { seedId: 'codex-linux',  name: 'Codex · Linux',    color: '#10a37f', command: 'curl -fsSL https://chatgpt.com/codex/install.sh | sh' },
+  // Antigravity (Google) — CLI
+  { seedId: 'antig-win',    name: 'Antigravity · Windows', color: '#4285f4', command: '[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; irm https://antigravity.google/cli/install.ps1 | iex' },
+  { seedId: 'antig-mac',    name: 'Antigravity · macOS',   color: '#4285f4', command: 'curl -fsSL https://antigravity.google/cli/install.sh | bash' },
+  { seedId: 'antig-linux',  name: 'Antigravity · Linux',   color: '#4285f4', command: 'curl -fsSL https://antigravity.google/cli/install.sh | bash' },
+  // OpenClaw (open source — npm, needs Node 22.19+/24)
+  { seedId: 'openclaw-win',   name: 'OpenClaw · Windows', color: '#e0603a', command: 'npm install -g openclaw@latest' },
+  { seedId: 'openclaw-mac',   name: 'OpenClaw · macOS',   color: '#e0603a', command: 'npm install -g openclaw@latest' },
+  { seedId: 'openclaw-linux', name: 'OpenClaw · Linux',   color: '#e0603a', command: 'npm install -g openclaw@latest' },
+  // Hermes Agent (open source — Nous Research)
+  { seedId: 'hermes-win',   name: 'Hermes · Windows', color: '#c678dd', command: 'pip install hermes-agent' },
+  { seedId: 'hermes-mac',   name: 'Hermes · macOS',   color: '#c678dd', command: 'curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash' },
+  { seedId: 'hermes-linux', name: 'Hermes · Linux',   color: '#c678dd', command: 'curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash' },
+];
+
+function seedDefaults() {
+  // load the store (map seedId -> last seeded command | true); migrate the old
+  // array-of-ids format to { id: true } so existing installs keep their history.
+  let store = {};
+  try {
+    const raw = JSON.parse(localStorage.getItem('termi.seededDefaults') || '{}');
+    if (Array.isArray(raw)) raw.forEach((id) => { store[id] = true; });
+    else if (raw && typeof raw === 'object') store = raw;
+  } catch { store = {}; }
+  let n = 0;
+
+  // a default button counts as UNEDITED (safe to refresh) if its current command is
+  // what we last seeded, or — for legacy `true` records — a known prior default.
+  const isUnedited = (existing, d) => {
+    const last = store[d.seedId];
+    if (typeof last === 'string') return existing.command === last;
+    if (existing.command === d.command) return true;
+    return (LEGACY_DEFAULT_COMMANDS[d.seedId] || []).includes(existing.command);
+  };
+
+  let cat = launchers.find((l) => l.type === 'category' && l.seedId === SEED_AI_CATEGORY.seedId);
+  if (!cat && !(SEED_AI_CATEGORY.seedId in store)) {
+    cat = {
+      id: 'l' + Date.now(), type: 'category', seedId: SEED_AI_CATEGORY.seedId,
+      name: SEED_AI_CATEGORY.name, color: SEED_AI_CATEGORY.color, children: [],
+    };
+    launchers.unshift(cat); // show the default category first
+    store[SEED_AI_CATEGORY.seedId] = true;
+    n++;
+  }
+  // if the category is gone but was once offered, the user deleted it -> don't recreate
+  if (cat) {
+    cat.children = cat.children || [];
+    SEED_AI_COMMANDS.forEach((d, i) => {
+      const existing = cat.children.find((c) => c.seedId === d.seedId);
+      if (!(d.seedId in store)) {
+        // never offered -> add it (first run / newly added tool)
+        if (!existing) {
+          cat.children.push({ id: 'l' + Date.now() + '_' + i, seedId: d.seedId, name: d.name, color: d.color, cwd: '', command: d.command });
+        }
+        store[d.seedId] = d.command;
+        n++;
+      } else if (existing) {
+        // offered before and still present -> refresh command if the user hasn't edited it
+        if (existing.command !== d.command && isUnedited(existing, d)) {
+          existing.command = d.command;
+          n++;
+        }
+        // upgrade a legacy/`true` record to the per-command baseline once it matches
+        if (existing.command === d.command && store[d.seedId] !== d.command) {
+          store[d.seedId] = d.command;
+          n++;
+        }
+      }
+      // offered before and now absent -> user deleted it -> respect, do nothing
+    });
+  }
+
+  if (n) {
+    saveLaunchers();
+    localStorage.setItem('termi.seededDefaults', JSON.stringify(store));
+  }
+}
+seedDefaults();
+
 // ---- saved web apps (define name+URL once, reusable browser launchers) ----
 function loadWebApps() {
   try { return JSON.parse(localStorage.getItem('termi.webapps') || '[]'); }
