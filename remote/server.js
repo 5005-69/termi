@@ -75,11 +75,20 @@ function parseCookies(h) {
 }
 
 const MIME = {
-  '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
+  '.html': 'text/html; charset=utf-8', '.htm': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
   '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
   '.json': 'application/json; charset=utf-8', '.map': 'application/json; charset=utf-8',
   '.ttf': 'font/ttf', '.woff': 'font/woff', '.woff2': 'font/woff2', '.svg': 'image/svg+xml',
   '.png': 'image/png', '.wasm': 'application/wasm',
+  // media + text, so the phone's html/media previews render instead of downloading
+  '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp',
+  '.bmp': 'image/bmp', '.ico': 'image/x-icon', '.avif': 'image/avif',
+  '.mp4': 'video/mp4', '.webm': 'video/webm', '.ogv': 'video/ogg', '.mov': 'video/quicktime',
+  '.m4v': 'video/mp4', '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.ogg': 'audio/ogg',
+  '.oga': 'audio/ogg', '.m4a': 'audio/mp4', '.flac': 'audio/flac', '.aac': 'audio/aac',
+  '.opus': 'audio/opus', '.pdf': 'application/pdf',
+  '.txt': 'text/plain; charset=utf-8', '.md': 'text/plain; charset=utf-8',
 };
 function mime(f) { return MIME[path.extname(f).toLowerCase()] || 'application/octet-stream'; }
 
@@ -240,6 +249,9 @@ async function handleRpc(session, op, args) {
     case 'settingsGetAll': return (state.userDataDir ? store.read(state.userDataDir) : {});
     case 'settingsSet': if (!state.control) return; persistSettings({ [a.key]: a.value }); return;
 
+    // ----- expose a PC dev-server port to the phone (its own quick tunnel) -----
+    case 'exposePort': return doOp(() => exposePort(a.port));
+
     default: return;
   }
 }
@@ -272,6 +284,24 @@ function flushSettings() {
   if (_setTimer) { clearTimeout(_setTimer); _setTimer = null; }
   const upd = _setBuf; _setBuf = {};
   if (state && state.userDataDir && Object.keys(upd).length) { try { store.merge(state.userDataDir, upd); } catch { /* */ } }
+}
+
+// Give a PC dev-server port its OWN cloudflare quick tunnel and return the public URL,
+// so the phone can show http://localhost:PORT (which the phone itself can't reach) inside
+// an <iframe> pane. One tunnel per port, reused across requests; a real origin means the
+// dev app's absolute paths / HMR work without any response rewriting. Started lazily.
+function exposePort(port) {
+  port = parseInt(port, 10);
+  if (!(port > 0 && port < 65536)) throw new Error('Μη έγκυρη θύρα');
+  if (!state || !state.cfBin) throw new Error('Το tunnel δεν είναι διαθέσιμο');
+  const existing = state.portTunnels.get(port);
+  if (existing) return existing.url ? Promise.resolve({ url: existing.url, port }) : existing.promise.then((url) => ({ url, port }));
+  const promise = tunnel.start(state.cfBin, port, {}).then((t) => {
+    state.portTunnels.set(port, { url: t.url, stop: t.stop, promise: null });
+    return t.url;
+  }).catch((err) => { state.portTunnels.delete(port); throw err; });
+  state.portTunnels.set(port, { url: null, stop: null, promise });
+  return promise.then((url) => ({ url, port }));
 }
 
 // Output that arrives while the phone is away is buffered (capped, oldest dropped) and
@@ -321,6 +351,7 @@ async function open(ctx) {
     userDataDir: ctx.userDataDir || null,    // where the shared settings store lives
     sessions: new Map(), loginAttempts: 0, heartbeat: null,
     server: null, wss: null, tunnel: null, port: 0, url: '',
+    cfBin: null, portTunnels: new Map(),     // extra tunnels exposing the PC's dev-server ports to the phone
   };
 
   const server = http.createServer(async (req, res) => {
@@ -340,6 +371,19 @@ async function open(ctx) {
       if (!NM_WHITELIST.some((w) => rel === w || rel.startsWith(w + '/'))) { res.writeHead(403); return res.end('no'); }
       const f = safeJoin(NODE_MODULES, rel);
       return f ? sendFile(res, f) : (res.writeHead(403), res.end('no'));
+    }
+
+    // authenticated raw-file serving: lets the phone's HTML/media previews load the
+    // PC's files (and their relative assets) the way file:// does on the desktop. The
+    // path after /fs/ is the absolute path, URL-encoded per segment. A logged-in session
+    // can already readFile anything over the RPC, so this adds no new capability.
+    if (req.method === 'GET' && p.startsWith('/fs/')) {
+      const sid = verifySessionCookie(parseCookies(req.headers.cookie).termi_sess, secret);
+      if (!sid) { res.writeHead(403); return res.end('no'); }
+      let abs = '';
+      try { abs = decodeURIComponent(p.slice('/fs/'.length)); } catch { abs = ''; }
+      if (!abs) { res.writeHead(404); return res.end('not found'); }
+      return sendFile(res, abs);
     }
 
     // login
@@ -424,6 +468,7 @@ async function open(ctx) {
   }, HEARTBEAT_MS);
 
   const bin = await tunnel.ensureBinary(ctx.userDataDir, ctx.onProgress);
+  state.cfBin = bin;                                  // reused to expose dev-server ports
   const t = await tunnel.start(bin, state.port, { onLog: ctx.onLog });
   state.tunnel = t; state.url = t.url;
 
@@ -445,6 +490,7 @@ function status() {
 function close() {
   if (!state) return { open: false };
   try { flushSettings(); } catch { /* persist any pending settings before shutdown */ }
+  try { for (const e of state.portTunnels.values()) { try { e.stop && e.stop(); } catch { /* */ } } } catch { /* */ }
   try { if (state.heartbeat) clearInterval(state.heartbeat); } catch { /* */ }
   try { for (const s of [...state.sessions.values()]) destroySession(s); } catch { /* */ }
   try { state.wss && state.wss.close(); } catch { /* */ }

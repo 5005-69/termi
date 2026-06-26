@@ -65,6 +65,9 @@
     // can seed localStorage SYNCHRONOUSLY before it reads it; settingsSet persists a change.
     settingsBootstrap: () => (window.__termiStore && typeof window.__termiStore === 'object') ? window.__termiStore : {},
     settingsSet: (k, v) => fire('settingsSet', { key: k, value: v }),
+    // expose a PC dev-server port through its own tunnel so a localhost page can be
+    // shown in an <iframe> pane on the phone (the phone can't reach the PC's localhost).
+    exposePort: (port) => invoke('exposePort', { port }),
     // window controls -> browser equivalents / no-ops
     winMinimize: () => {},
     winMaximize: () => {},

@@ -60,6 +60,10 @@ contextBridge.exposeInMainWorld('termi', {
   settingsBootstrap: () => { try { return ipcRenderer.sendSync('settings:getAll') || {}; } catch { return {}; } },
   settingsSet: (k, v) => ipcRenderer.send('settings:set', { k, v }),
 
+  // expose a dev-server port (desktop uses a real <webview>, so this is a no-op stub
+  // that just hands back the localhost URL; only the phone bridge actually tunnels).
+  exposePort: (port) => Promise.resolve({ ok: true, value: { url: 'http://localhost:' + port } }),
+
   // app info
   appVersion: () => ipcRenderer.invoke('app:version'),
 

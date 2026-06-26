@@ -483,12 +483,20 @@ body.header-hidden #header-hotzone {
 /* The actual <webview> lives in #webview-layer (never reparented, so it never reloads
    on a layout change); this slot just reserves the body area we position it over. */
 .pane-body.webview-body { padding: 0; background: #fff; }
-.webview-slot { width: 100%; height: 100%; }
+/* the slot reserves the body area; its text shows behind the overlay frame as a
+   status (e.g. "connecting…" on the phone before the iframe loads over it). */
+.webview-slot {
+  width: 100%; height: 100%;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--muted); font-size: 13px; text-align: center; padding: 8px;
+}
 
 #webview-layer { position: fixed; inset: 0; pointer-events: none; z-index: 6; }
-#webview-layer webview { position: absolute; pointer-events: auto; background: #fff; display: flex; }
+#webview-layer webview,
+#webview-layer iframe.wv-frame { position: absolute; pointer-events: auto; background: #fff; display: flex; border: 0; }
 /* while a pane is being dragged, let elementFromPoint fall through to the pane underneath */
-body.dragging #webview-layer webview { pointer-events: none; }
+body.dragging #webview-layer webview,
+body.dragging #webview-layer iframe.wv-frame { pointer-events: none; }
 
 .pane-bar button.wv-nav { padding: 3px 4px; display: inline-flex; align-items: center; }
 .pane-bar button.wv-nav .codicon { font-size: 13px; }

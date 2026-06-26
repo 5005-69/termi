@@ -118,7 +118,15 @@ function detectMode(p) {
 }
 const MEDIA_MODES = new Set(['image', 'video', 'audio', 'pdf']);
 
-function fileUrl(p) { return 'file:///' + encodeURI(p.replace(/\\/g, '/')); }
+// On the desktop a preview iframe/media element loads the file via file://. On the phone
+// file:// points at the PHONE's disk (so previews were blank) — instead we route through
+// the remote server's authenticated /fs/ endpoint, which serves the PC's file and its
+// relatively-referenced assets (so an .html opened on the phone renders just like desktop).
+function fileUrl(p) {
+  const fwd = p.replace(/\\/g, '/');
+  if (isRemote) return '/fs/' + fwd.split('/').map(encodeURIComponent).join('/');
+  return 'file:///' + encodeURI(fwd);
+}
 
 const LANG_BY_EXT = {
   js: 'javascript', mjs: 'javascript', cjs: 'javascript', jsx: 'javascript',
@@ -549,7 +557,7 @@ window.termi.onData(({ id, data }) => {
   const v = views.get(id);
   if (!v || v.kind !== 'terminal') return;
   v.term.write(data);
-  if (!isRemote) detectLocalUrls(v, id, data);   // offer to open dev-server URLs
+  detectLocalUrls(v, id, data);   // offer to open dev-server URLs (in a pane; via tunnel on the phone)
 });
 window.termi.onExit(({ id }) => {
   const v = views.get(id);
@@ -601,7 +609,9 @@ function detectLocalUrls(v, id, data) {
 }
 
 function openLocalUrl(url, action) {
-  if (action === 'external') window.termi.openExternal(url);
+  // on the phone "external" (a real browser tab) can't reach the PC's localhost, so
+  // every local URL opens in an in-app pane (served through a per-port tunnel).
+  if (action === 'external' && !isRemote) window.termi.openExternal(url);
   else openBrowserPane(url);
 }
 
@@ -620,6 +630,8 @@ function showUrlToast(paneId, url) {
     </div>
     <label class="ut-remember"><input type="checkbox"> Να μην ξαναρωτηθώ</label>`;
   toast.querySelector('.ut-url').textContent = url;
+  // the phone has no usable "open in a real browser tab" (can't reach the PC's localhost)
+  if (isRemote) { const ext = toast.querySelector('.ut-ext'); if (ext) ext.remove(); }
   document.body.appendChild(toast);
 
   const offset = (document.querySelectorAll('.url-toast').length - 1) * 70;
@@ -684,6 +696,7 @@ function layoutWebviews() {
 function mountWebviewView(leaf) {
   let v = views.get(leaf.id);
   if (v) return v;
+  if (isRemote) return mountIframeView(leaf);
 
   const wv = document.createElement('webview');
   wv.setAttribute('partition', 'persist:webapps');  // one shared, persistent profile -> logins stick
@@ -709,6 +722,61 @@ function mountWebviewView(leaf) {
   });
   views.set(leaf.id, v);
   return v;
+}
+
+// ---- phone (remote) browser pane = an <iframe> (no <webview> off Electron) ----
+// It still lives in the persistent overlay layer (so it never reloads on a re-render)
+// and is only ever pointed at a PC dev-server exposed through its own tunnel. Like the
+// webview it's positioned over its pane's slot by layoutWebviews (which uses v.wv).
+function mountIframeView(leaf) {
+  const fr = document.createElement('iframe');
+  fr.className = 'wv-frame';
+  fr.setAttribute('src', leaf.url || 'about:blank');
+  fr.setAttribute('allow', 'fullscreen; clipboard-read; clipboard-write');
+  fr.style.display = 'none';
+  webviewLayer.appendChild(fr);
+  const v = { kind: 'webview', el: fr, wv: fr, ro: { disconnect() {} }, slot: null, urlInput: null, remote: true };
+  views.set(leaf.id, v);
+  return v;
+}
+
+// Parse a localhost-style URL into { full, host, port, path }, or null if it isn't local.
+function parseLocalUrl(raw) {
+  const u = (raw || '').trim();
+  const m = u.match(/^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::(\d+))?(\/[^\s]*)?$/i);
+  if (!m) return null;
+  return { full: u, host: m[1], port: m[2] ? parseInt(m[2], 10) : 80, path: m[3] || '/' };
+}
+// Normalize loose input (a bare port "3000", "localhost:3000", a full URL) to a parsed
+// local URL, or null if it isn't a localhost target.
+function toLocalUrl(raw) {
+  const s = (raw || '').trim();
+  if (!s) return null;
+  let u = s;
+  if (/^\d+$/.test(s)) u = 'http://localhost:' + s;
+  else if (!/^https?:\/\//i.test(s)) u = 'http://' + s;
+  return parseLocalUrl(u);
+}
+// A message shown inside a browser pane's slot, behind the iframe (e.g. "connecting…").
+function setSlotMsg(v, msg) { if (v && v.slot) v.slot.textContent = msg || ''; }
+
+// Point a remote browser pane at a localhost URL: expose its port through a tunnel, then
+// load the resulting public URL in the iframe. Keeps leaf.localUrl for a friendly display.
+function navigateRemotePane(v, leaf, raw) {
+  const parsed = toLocalUrl(raw);
+  if (!parsed) { setSlotMsg(v, 'Στο κινητό το pane δουλεύει μόνο για localhost.'); return; }
+  leaf.localUrl = parsed.full;
+  leaf.name = 'localhost:' + parsed.port;
+  const ni = nameInputs.get(leaf.id); if (ni) ni.value = leaf.name;
+  if (v && v.urlInput && document.activeElement !== v.urlInput) v.urlInput.value = parsed.full;
+  setSlotMsg(v, 'Σύνδεση μέσω tunnel…');
+  window.termi.exposePort(parsed.port).then((res) => {
+    const vv = views.get(leaf.id);
+    if (!vv) return;
+    if (!res || !res.ok || !res.value || !res.value.url) { setSlotMsg(vv, 'Αποτυχία σύνδεσης στη θύρα ' + parsed.port); return; }
+    leaf.url = res.value.url.replace(/\/$/, '') + parsed.path;
+    try { vv.wv.src = leaf.url; } catch { /* */ }
+  });
 }
 
 // Turn what the user typed into a URL, the way a browser address bar does:
@@ -1281,24 +1349,37 @@ function renderPane(leaf) {
       b.addEventListener('click', (e) => { e.stopPropagation(); try { fn(); } catch { /* */ } });
       return b;
     };
-    const back = navBtn('arrow-left', 'Πίσω', () => { if (v.wv.canGoBack && v.wv.canGoBack()) v.wv.goBack(); });
-    const fwd = navBtn('arrow-right', 'Μπροστά', () => { if (v.wv.canGoForward && v.wv.canGoForward()) v.wv.goForward(); });
-    const reload = navBtn('refresh', 'Ανανέωση', () => v.wv.reload());
+    // reload: <webview>.reload() on desktop; on the phone an <iframe> reloads by re-setting src.
+    const reload = navBtn('refresh', 'Ανανέωση', () => {
+      if (isRemote) { try { v.wv.src = leaf.url || v.wv.src; } catch { /* */ } }
+      else v.wv.reload();
+    });
 
     const urlInput = document.createElement('input');
     urlInput.className = 'wv-url';
     urlInput.spellcheck = false;
-    urlInput.value = leaf.url || '';
-    urlInput.placeholder = 'Διεύθυνση ή αναζήτηση…';
+    urlInput.value = isRemote ? (leaf.localUrl || '') : (leaf.url || '');
+    urlInput.placeholder = isRemote ? 'localhost θύρα ή URL…' : 'Διεύθυνση ή αναζήτηση…';
     urlInput.addEventListener('pointerdown', (e) => e.stopPropagation()); // don't start a pane drag
     urlInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); navigateWebview(v, leaf, urlInput.value); urlInput.blur(); }
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      if (isRemote) navigateRemotePane(v, leaf, urlInput.value);
+      else navigateWebview(v, leaf, urlInput.value);
+      urlInput.blur();
     });
     v.urlInput = urlInput;
 
-    const star = navBtn('star-empty', 'Αποθήκευση ως εφαρμογή', () => saveCurrentAsApp(leaf));
-
-    bar.append(dot, colorInput, name, back, fwd, reload, urlInput, star, fsBtn, closeBtn);
+    // back/fwd + save-as-app are desktop-only (cross-origin iframe can't navigate history,
+    // and the phone's browser panes are localhost-only, not arbitrary saveable sites).
+    if (isRemote) {
+      bar.append(dot, colorInput, name, reload, urlInput, fsBtn, closeBtn);
+    } else {
+      const back = navBtn('arrow-left', 'Πίσω', () => { if (v.wv.canGoBack && v.wv.canGoBack()) v.wv.goBack(); });
+      const fwd = navBtn('arrow-right', 'Μπροστά', () => { if (v.wv.canGoForward && v.wv.canGoForward()) v.wv.goForward(); });
+      const star = navBtn('star-empty', 'Αποθήκευση ως εφαρμογή', () => saveCurrentAsApp(leaf));
+      bar.append(dot, colorInput, name, back, fwd, reload, urlInput, star, fsBtn, closeBtn);
+    }
     body.className = 'pane-body webview-body';
     const slot = document.createElement('div');
     slot.className = 'webview-slot';
@@ -1590,9 +1671,11 @@ function addPane() {
 }
 
 // Open a web page in a new browser pane (split off the focused one). On the phone
-// (remote) there's no <webview>, so fall back to a real browser tab.
+// (remote) only localhost is supported, in an <iframe> served through a per-port tunnel
+// (a real browser tab there can't reach the PC's localhost, and arbitrary sites can't be
+// iframed). Non-local URLs on the phone just show a hint instead of spawning a Chrome tab.
 function openBrowserPane(url, name) {
-  if (isRemote) { window.open(url || 'https://www.google.com', '_blank'); return; }
+  if (isRemote) return openRemoteLocalhostPane(url, name);
   if (fullscreenId) fullscreenId = null;
   const leaf = makeBrowserLeaf(url);
   if (name) leaf.name = name;
@@ -1606,6 +1689,46 @@ function openBrowserPane(url, name) {
   splitTarget(target, leaf, 'right');
   focusedId = leaf.id;
   render();
+}
+
+function openRemoteLocalhostPane(rawUrl, name) {
+  const parsed = parseLocalUrl(rawUrl);
+  if (!parsed) { showInfoToast('Στο κινητό το browser pane ανοίγει μόνο localhost διευθύνσεις.'); return; }
+  if (fullscreenId) fullscreenId = null;
+  const leaf = makeBrowserLeaf('about:blank');
+  leaf.localUrl = parsed.full;
+  leaf.name = name || ('localhost:' + parsed.port);
+  if (!root) { root = leaf; focusedId = leaf.id; }
+  else { splitTarget(findLeaf(focusedId) || firstLeaf(root), leaf, 'right'); focusedId = leaf.id; }
+  render();
+  const v = views.get(leaf.id);
+  setSlotMsg(v, 'Σύνδεση μέσω tunnel…');
+  window.termi.exposePort(parsed.port).then((res) => {
+    const vv = views.get(leaf.id);
+    if (!vv) return;
+    if (!res || !res.ok || !res.value || !res.value.url) { setSlotMsg(vv, 'Αποτυχία σύνδεσης στη θύρα ' + parsed.port); return; }
+    leaf.url = res.value.url.replace(/\/$/, '') + parsed.path;
+    try { vv.wv.src = leaf.url; } catch { /* */ }
+  });
+}
+
+// Accept a bare port (3000), host:port, or full URL from the +browser localhost box.
+function openLocalhostFromInput(val) {
+  const parsed = toLocalUrl(val);
+  if (!parsed) { showInfoToast('Δώσε μια θύρα ή μια localhost διεύθυνση.'); return; }
+  openBrowserPane(parsed.full);
+}
+
+// A small, self-dismissing toast centered at the bottom (reuses .url-toast styling).
+function showInfoToast(msg) {
+  const t = document.createElement('div');
+  t.className = 'url-toast';
+  t.style.left = '50%';
+  t.style.top = (window.innerHeight - 24) + 'px';
+  t.innerHTML = '<div class="ut-msg"></div>';
+  t.querySelector('.ut-msg').textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 4000);
 }
 
 function closePane(leaf) {
@@ -1939,27 +2062,48 @@ function openBrowserMenu(anchor) {
   };
   const sep = () => { const s = document.createElement('div'); s.className = 'bm-sep'; menu.appendChild(s); };
 
-  addItem('Νέα κενή καρτέλα', 'globe', () => { close(); openBrowserPane(); });
-  if (webApps.length) {
-    sep();
-    webApps.forEach((app) => {
-      addItem(app.name, 'star-full', () => { close(); openBrowserPane(app.url, app.name); }, {
-        title: app.url,
-        onDelete: () => { webApps = webApps.filter((a) => a.id !== app.id); saveWebApps(); close(); openBrowserMenu(anchor); },
+  if (isRemote) {
+    // phone: browser panes are localhost-only (served through a tunnel), so the entry
+    // point is a small box to type a port/URL — no blank tab, no arbitrary saved sites.
+    const hdr0 = document.createElement('div');
+    hdr0.className = 'bm-head';
+    hdr0.textContent = 'Προεπισκόπηση localhost σε pane:';
+    menu.appendChild(hdr0);
+    const row = document.createElement('div');
+    row.className = 'bm-item';
+    const inp = document.createElement('input');
+    inp.className = 'wv-url';
+    inp.style.width = '100%';
+    inp.placeholder = 'θύρα (π.χ. 3000) ή URL';
+    inp.addEventListener('pointerdown', (e) => e.stopPropagation());
+    inp.addEventListener('click', (e) => e.stopPropagation());
+    inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') { const val = inp.value; close(); openLocalhostFromInput(val); } });
+    row.appendChild(inp);
+    menu.appendChild(row);
+  } else {
+    addItem('Νέα κενή καρτέλα', 'globe', () => { close(); openBrowserPane(); });
+    if (webApps.length) {
+      sep();
+      webApps.forEach((app) => {
+        addItem(app.name, 'star-full', () => { close(); openBrowserPane(app.url, app.name); }, {
+          title: app.url,
+          onDelete: () => { webApps = webApps.filter((a) => a.id !== app.id); saveWebApps(); close(); openBrowserMenu(anchor); },
+        });
       });
-    });
+    }
+    sep();
+    addItem('Προσθήκη εφαρμογής…', 'add', () => { close(); openWebAppModal({}); }, { cls: 'bm-add' });
   }
-  sep();
-  addItem('Προσθήκη εφαρμογής…', 'add', () => { close(); openWebAppModal({}); }, { cls: 'bm-add' });
 
-  // settings (in-panel, no extra popup): how detected local URLs should open
+  // settings (in-panel, no extra popup): how detected local URLs should open. On the
+  // phone "external" isn't possible (no reach to the PC's localhost), so it's hidden.
   sep();
   const hdr = document.createElement('div');
   hdr.className = 'bm-head';
   hdr.textContent = 'Τοπικά URL ανοίγουν:';
   menu.appendChild(hdr);
   const optLabels = { ask: 'Ερώτηση κάθε φορά', pane: 'Πάντα σε pane', external: 'Πάντα στον browser' };
-  ['ask', 'pane', 'external'].forEach((opt) => {
+  (isRemote ? ['ask', 'pane'] : ['ask', 'pane', 'external']).forEach((opt) => {
     const it = addItem(optLabels[opt], urlAction === opt ? 'circle-filled' : 'circle-outline', () => {
       urlAction = opt; saveUrlAction();
       // repaint the three radios in place (no menu rebuild -> no listener churn)
