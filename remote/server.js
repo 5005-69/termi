@@ -26,6 +26,7 @@ const QRCode = require('qrcode');
 const pty = require('node-pty');
 const simpleGit = require('simple-git');
 const tunnel = require('./tunnel');
+const store = require('../store');     // shared settings store (same memory as the desktop)
 
 let electronClipboard = null;
 try { electronClipboard = require('electron').clipboard; } catch { /* not in electron (tests) */ }
@@ -91,12 +92,21 @@ function sendFile(res, file) {
 }
 // Serve the real src/index.html with the web bridge + mobile CSS injected. The
 // original file on disk is never modified — injection happens in memory per request.
-function serveIndexInjected(res) {
+// For an AUTHENTICATED request we also inline the shared settings store as
+// window.__termiStore, so the phone seeds localStorage with the SAME launchers and
+// settings as the desktop SYNCHRONOUSLY, before renderer.js reads them.
+function serveIndexInjected(req, res) {
   fs.readFile(path.join(SRC_DIR, 'index.html'), 'utf8', (err, html) => {
     if (err) { res.writeHead(404); res.end('not found'); return; }
+    let storeObj = {};
+    try {
+      const sid = verifySessionCookie(parseCookies(req.headers.cookie).termi_sess, state.secret);
+      if (sid && state.userDataDir) storeObj = store.read(state.userDataDir);
+    } catch { /* unauthenticated -> empty; the page reloads after PIN login */ }
+    const inj = JSON.stringify(storeObj).replace(/</g, '\\u003c');   // never break out of <script>
     html = html.replace(
       '<script src="renderer.js"></script>',
-      '<script src="/web/termi-bridge.js"></script>\n  <script src="renderer.js"></script>'
+      `<script>window.__termiStore=${inj};</script>\n  <script src="/web/termi-bridge.js"></script>\n  <script src="renderer.js"></script>`
     );
     html = html.replace('</head>', '  <link rel="stylesheet" href="/web/mobile.css" />\n</head>');
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
@@ -226,6 +236,10 @@ async function handleRpc(session, op, args) {
     case 'clipboardRead': return electronClipboard ? electronClipboard.readText() : '';
     case 'clipboardWrite': if (electronClipboard) electronClipboard.writeText(a.text || ''); return;
 
+    // ----- shared settings store (same memory as the desktop) -----
+    case 'settingsGetAll': return (state.userDataDir ? store.read(state.userDataDir) : {});
+    case 'settingsSet': if (!state.control) return; persistSettings({ [a.key]: a.value }); return;
+
     default: return;
   }
 }
@@ -242,6 +256,22 @@ function watchForSession(session, dir) {
     });
     session.watcher.on('error', () => { try { session.watcher.close(); } catch { /* */ } session.watcher = null; });
   } catch { /* */ }
+}
+
+// Write-through of termi.* settings to the shared store, debounced (a single drag can
+// fire many saves). Read-merge-write inside store.merge keeps the desktop's and the
+// phone's keys from clobbering each other.
+let _setBuf = {}, _setTimer = null;
+function persistSettings(updates) {
+  if (!state || !state.userDataDir) return;
+  Object.assign(_setBuf, updates);
+  if (_setTimer) return;
+  _setTimer = setTimeout(flushSettings, 300);
+}
+function flushSettings() {
+  if (_setTimer) { clearTimeout(_setTimer); _setTimer = null; }
+  const upd = _setBuf; _setBuf = {};
+  if (state && state.userDataDir && Object.keys(upd).length) { try { store.merge(state.userDataDir, upd); } catch { /* */ } }
 }
 
 // Output that arrives while the phone is away is buffered (capped, oldest dropped) and
@@ -288,6 +318,7 @@ async function open(ctx) {
   const secret = crypto.randomBytes(32);
   state = {
     token, pin, secret, control: ctx.controlEnabled !== false,
+    userDataDir: ctx.userDataDir || null,    // where the shared settings store lives
     sessions: new Map(), loginAttempts: 0, heartbeat: null,
     server: null, wss: null, tunnel: null, port: 0, url: '',
   };
@@ -296,7 +327,7 @@ async function open(ctx) {
     const p = new URL(req.url, 'http://localhost').pathname;
 
     // web entry = the REAL src/index.html with 2 tags injected (bridge + mobile css)
-    if (req.method === 'GET' && (p === '/' || p === '/index.html')) return serveIndexInjected(res);
+    if (req.method === 'GET' && (p === '/' || p === '/index.html')) return serveIndexInjected(req, res);
     if (req.method === 'GET' && p === '/web/termi-bridge.js') return sendFile(res, path.join(PUBLIC_DIR, 'termi-bridge.js'));
     if (req.method === 'GET' && p === '/web/mobile.css') return sendFile(res, path.join(PUBLIC_DIR, 'mobile.css'));
 
@@ -413,6 +444,7 @@ function status() {
 
 function close() {
   if (!state) return { open: false };
+  try { flushSettings(); } catch { /* persist any pending settings before shutdown */ }
   try { if (state.heartbeat) clearInterval(state.heartbeat); } catch { /* */ }
   try { for (const s of [...state.sessions.values()]) destroySession(s); } catch { /* */ }
   try { state.wss && state.wss.close(); } catch { /* */ }

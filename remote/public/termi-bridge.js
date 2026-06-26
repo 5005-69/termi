@@ -60,6 +60,11 @@
     pickFolder: (current) => openFolderPicker(current),
     // open externally -> a new browser tab (no native shell on a phone)
     openExternal: (url) => { try { window.open(url, '_blank'); } catch (e) { /* */ } },
+    // shared settings store (same "memory" as the desktop). settingsBootstrap returns
+    // the settings the server inlined into this page (window.__termiStore) so renderer.js
+    // can seed localStorage SYNCHRONOUSLY before it reads it; settingsSet persists a change.
+    settingsBootstrap: () => (window.__termiStore && typeof window.__termiStore === 'object') ? window.__termiStore : {},
+    settingsSet: (k, v) => fire('settingsSet', { key: k, value: v }),
     // window controls -> browser equivalents / no-ops
     winMinimize: () => {},
     winMaximize: () => {},
@@ -186,7 +191,11 @@
       try {
         const res = await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token, pin: v }) });
         const data = await res.json().catch(() => ({}));
-        if (res.ok && data.ok) { failStreak = 0; backoff = 500; manualClose = false; connect(); }
+        // Reload after a fresh PIN login so the now-authenticated GET / inlines the
+        // shared settings (window.__termiStore) and the page opens with the same
+        // launchers/settings as the desktop. The cookie persists, so boot() then
+        // auto-resumes the WebSocket without asking for the PIN again.
+        if (res.ok && data.ok) { manualClose = false; location.reload(); }
         else if (res.status === 429) err.textContent = 'Πολλές αποτυχημένες προσπάθειες. Κλείσε & άνοιξε ξανά την πόρτα.';
         else err.textContent = 'Λάθος PIN' + (data.left != null ? ' (απομένουν ' + data.left + ')' : '');
       } catch { err.textContent = 'Σφάλμα σύνδεσης.'; }

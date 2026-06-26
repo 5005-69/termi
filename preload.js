@@ -55,6 +55,11 @@ contextBridge.exposeInMainWorld('termi', {
   // open a URL in the native default browser
   openExternal: (url) => ipcRenderer.invoke('shell:openExternal', url),
 
+  // shared settings store (same "memory" on desktop & phone). settingsBootstrap is
+  // SYNCHRONOUS so the renderer can seed localStorage before it reads it at startup.
+  settingsBootstrap: () => { try { return ipcRenderer.sendSync('settings:getAll') || {}; } catch { return {}; } },
+  settingsSet: (k, v) => ipcRenderer.send('settings:set', { k, v }),
+
   // app info
   appVersion: () => ipcRenderer.invoke('app:version'),
 

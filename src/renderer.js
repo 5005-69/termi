@@ -49,6 +49,51 @@ function makeBrowserLeaf(url) {
 // back to opening a real browser tab there.
 const isRemote = !!(window.termi && String(window.termi.version || '').startsWith('web'));
 
+// ---------------- shared settings store (same "memory" on desktop & phone) ----------------
+// The command launchers and other termi.* settings live in ONE store on the PC (the
+// desktop via IPC, the phone via the remote server — both hit the same file). We seed
+// localStorage from that store BEFORE anything reads it, then mirror future termi.* writes
+// back to it. Result: opening termi on the phone shows the SAME buttons/settings as the
+// desktop, and an edit on either side persists for both. No-op if the host has no store API.
+(function syncSharedSettings() {
+  const t = window.termi;
+  if (!t || typeof t.settingsBootstrap !== 'function' || typeof t.settingsSet !== 'function') return;
+  let seed = {};
+  try { seed = t.settingsBootstrap() || {}; } catch (e) { seed = {}; }
+  const hadStore = seed && Object.keys(seed).some((k) => k.indexOf('termi.') === 0);
+  // 1) seed localStorage from the shared store (the store wins on load). Done BEFORE the
+  //    write-through wrap below, so these seed writes don't echo back to the store.
+  try {
+    for (const k in seed) { if (k.indexOf('termi.') === 0 && seed[k] != null) localStorage.setItem(k, seed[k]); }
+  } catch (e) { /* */ }
+  // 2) mirror future termi.* writes (and removals) to the shared store.
+  try {
+    const proto = Storage.prototype;
+    if (!proto.__termiWrapped) {
+      proto.__termiWrapped = true;
+      const origSet = proto.setItem, origRemove = proto.removeItem;
+      proto.setItem = function (k, v) {
+        origSet.call(this, k, v);
+        if (typeof k === 'string' && k.indexOf('termi.') === 0) { try { window.termi.settingsSet(k, String(v)); } catch (e) { /* */ } }
+      };
+      proto.removeItem = function (k) {
+        origRemove.call(this, k);
+        if (typeof k === 'string' && k.indexOf('termi.') === 0) { try { window.termi.settingsSet(k, null); } catch (e) { /* */ } }
+      };
+    }
+  } catch (e) { /* */ }
+  // 3) first run on the DESKTOP with an empty store: migrate the existing localStorage
+  //    into it, so the phone inherits buttons/settings created before this feature.
+  if (!hadStore && !isRemote) {
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.indexOf('termi.') === 0) { try { window.termi.settingsSet(k, localStorage.getItem(k)); } catch (e) { /* */ } }
+      }
+    } catch (e) { /* */ }
+  }
+})();
+
 function basename(p) { return p ? p.split(/[\\/]/).pop() : ''; }
 function extOf(p) { const b = basename(p); const i = b.lastIndexOf('.'); return i > 0 ? b.slice(i + 1).toLowerCase() : ''; }
 function escapeHtml(s) {

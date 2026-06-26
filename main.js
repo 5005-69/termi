@@ -6,6 +6,7 @@ const fsp = require('fs').promises;
 const pty = require('node-pty');
 const simpleGit = require('simple-git');
 const { autoUpdater } = require('electron-updater');
+const store = require('./store');
 
 /** @type {Map<string, import('node-pty').IPty>} */
 const ptys = new Map();
@@ -232,6 +233,26 @@ ipcMain.handle('dialog:pickFolder', async (e, current) => {
   });
   if (res.canceled || !res.filePaths.length) return null;
   return res.filePaths[0];
+});
+
+// ---------------- shared settings store (same "memory" on desktop & phone) ----------------
+// The launchers and other termi.* settings live in one file on the PC (see store.js).
+// settings:getAll is SYNCHRONOUS (sendSync) so the renderer can seed localStorage with
+// it BEFORE it reads it at startup; settings:set writes a change through (debounced,
+// since drags fire many saves). The phone uses the same file via remote/server.js.
+ipcMain.on('settings:getAll', (e) => {
+  try { e.returnValue = store.read(app.getPath('userData')); } catch { e.returnValue = {}; }
+});
+let _settingsBuf = {}, _settingsTimer = null;
+ipcMain.on('settings:set', (e, msg) => {
+  const k = msg && msg.k;
+  if (typeof k !== 'string') return;
+  _settingsBuf[k] = msg.v;
+  if (_settingsTimer) return;
+  _settingsTimer = setTimeout(() => {
+    const upd = _settingsBuf; _settingsBuf = {}; _settingsTimer = null;
+    try { store.merge(app.getPath('userData'), upd); } catch { /* */ }
+  }, 300);
 });
 
 // ---------------- remote control (phone via Cloudflare tunnel) ----------------
