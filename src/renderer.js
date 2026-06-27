@@ -347,11 +347,15 @@ const views = new Map();
 
 const TERM_THEME = {
   background: '#0d1117',
-  foreground: '#c9d1d9',
+  foreground: '#d3dae3',
   cursor: '#58a6ff',
-  selectionBackground: 'rgba(88,166,255,0.3)',
+  cursorAccent: '#0d1117',
+  selectionBackground: 'rgba(88,166,255,0.38)',
+  selectionForeground: '#f0f6fc',
   black: '#484f58', red: '#ff7b72', green: '#3fb950', yellow: '#d29922',
   blue: '#58a6ff', magenta: '#bc8cff', cyan: '#39c5cf', white: '#b1bac4',
+  brightBlack: '#6e7681', brightRed: '#ffa198', brightGreen: '#56d364', brightYellow: '#e3b341',
+  brightBlue: '#79c0ff', brightMagenta: '#d2a8ff', brightCyan: '#56d4dd', brightWhite: '#f0f6fc',
 };
 
 function mountView(leaf) {
@@ -364,7 +368,14 @@ function mountView(leaf) {
   const term = new Terminal({
     fontFamily: '"Cascadia Code", "Consolas", monospace',
     fontSize: leaf.fontSize || 13,
+    fontWeight: '400',
+    fontWeightBold: '600',
+    lineHeight: 1.22,
+    letterSpacing: 0.4,
     cursorBlink: true,
+    cursorStyle: 'bar',
+    cursorWidth: 2,
+    scrollback: 5000,
     allowProposedApi: true,
     // cursor (the "pillar" at the active line) matches the pane's frame color
     theme: { ...TERM_THEME, cursor: leaf.color || TERM_THEME.cursor },

@@ -474,10 +474,21 @@ body.header-hidden #header-hotzone {
 .term-host {
   width: 100%;
   height: 100%;
+  position: relative;
+  /* breathing room so glyphs don't kiss the colored pane frame */
+  padding: 5px 6px 4px 8px;
 }
 .term-host .xterm { height: 100%; }
 .term-host .xterm-viewport { overflow-y: auto; }
 .term-host.term-droptarget { outline: 2px dashed #58a6ff; outline-offset: -2px; }
+/* faint top sheen for depth — ambient only (3% white), never hurts legibility */
+.term-host::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(180deg, rgba(255,255,255,0.035) 0%, rgba(255,255,255,0) 60px);
+}
 
 /* ---- Web browser pane ---- */
 /* The actual <webview> lives in #webview-layer (never reparented, so it never reloads
