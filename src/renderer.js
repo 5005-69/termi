@@ -168,6 +168,10 @@ function whenMonaco(cb) { if (monacoReady) cb(); else monacoQueue.push(cb); }
 let root = makeLeaf();
 let focusedId = root.id;
 let fullscreenId = null;
+// A browser pane can auto-hide its OWN bar (per-pane `leaf.barHidden`): the bar collapses to
+// reclaim the space and peeks back when the cursor reaches that pane's top edge — purely
+// local, it never touches the app header or window. peekPaneId = the pane currently peeking.
+let peekPaneId = null;
 // Panes pulled off the layout but kept ALIVE (terminal/pty keeps running). They live in
 // the "Ελαχιστοποιημένα" header tray; their views stay in the views Map (never destroyed)
 // so restoring re-attaches the exact same session — same mechanism fullscreen uses to hide
@@ -572,7 +576,9 @@ function destroyView(id) {
   } else if (v.kind === 'webview') {
     nameInputs.delete(id);
     try { v.wv.remove(); } catch { /* */ }   // removing from the layer destroys the guest
+    try { v.hotzone && v.hotzone.remove(); } catch { /* */ }
   }
+  if (peekPaneId === id) peekPaneId = null;
   views.delete(id);
 }
 
@@ -706,15 +712,55 @@ function layoutWebviews() {
   const base = webviewLayer.getBoundingClientRect();
   for (const [id, v] of views) {
     if (v.kind !== 'webview') continue;
-    if (!visible.has(id) || !v.slot || !v.slot.isConnected) { v.wv.style.display = 'none'; continue; }
+    const hideHz = () => { if (v.hotzone) v.hotzone.style.display = 'none'; };
+    if (!visible.has(id) || !v.slot || !v.slot.isConnected) { v.wv.style.display = 'none'; hideHz(); continue; }
     const r = v.slot.getBoundingClientRect();
-    if (r.width < 1 || r.height < 1) { v.wv.style.display = 'none'; continue; }
+    if (r.width < 1 || r.height < 1) { v.wv.style.display = 'none'; hideHz(); continue; }
     v.wv.style.display = 'flex';
     v.wv.style.left = (r.left - base.left) + 'px';
     v.wv.style.top = (r.top - base.top) + 'px';
     v.wv.style.width = r.width + 'px';
     v.wv.style.height = r.height + 'px';
+    // reveal hot-zone over the pane's top edge only while this pane is auto-hiding its bar.
+    // It lives in the layer (above the webview) so the hover registers despite the webview.
+    const leaf = findLeaf(id);
+    const pane = v.slot.closest('.pane');
+    if (v.hotzone && leaf && leaf.barHidden && pane) {
+      const pr = pane.getBoundingClientRect();
+      let hzTop = pr.top - base.top;
+      // When the app header is ALSO auto-hidden, its own hot-zone owns the very top 8px
+      // (z-index 99, above this layer) and would swallow the hover for a pane that reaches
+      // the top edge. Drop ours just below it so BOTH stay reachable — the app header on the
+      // top line, this pane's bar (the drag grip) right under it.
+      if (headerHideActive && hzTop < 9) hzTop = 9;
+      v.hotzone.style.display = 'block';
+      v.hotzone.style.left = (pr.left - base.left) + 'px';
+      v.hotzone.style.top = hzTop + 'px';
+      v.hotzone.style.width = pr.width + 'px';
+    } else {
+      hideHz();
+    }
   }
+}
+
+// A thin hover strip over a browser pane's top edge that reveals its auto-hidden bar. It
+// sits in #webview-layer above the webview (pointer-events:auto) so the hover is detected
+// even though the webview covers the pane's content.
+function makeBarHotzone(leaf) {
+  const hz = document.createElement('div');
+  hz.className = 'bar-hotzone';
+  hz.style.display = 'none';
+  hz.addEventListener('mouseenter', () => { if (leaf.barHidden) setBarPeek(leaf.id); });
+  // The strip doubles as a drag handle: a browser pane's bar is packed with controls and
+  // leaves almost no empty space to grab, so when the bar is hidden this is the reliable
+  // place to grab the pane and move it in the grid (works whether or not it's peeking).
+  hz.addEventListener('pointerdown', (e) => {
+    focusedId = leaf.id;
+    updateFocusClasses();
+    startPaneDrag(e, leaf);
+  });
+  webviewLayer.appendChild(hz);
+  return hz;
 }
 
 function mountWebviewView(leaf) {
@@ -730,10 +776,14 @@ function mountWebviewView(leaf) {
   wv.setAttribute('allowpopups', 'true');  // let OAuth (Google login) window.open popups through
   wv.setAttribute('src', leaf.url || 'about:blank');
   wv.style.display = 'none';
+  // entering the guest area means the cursor is past the headers -> collapse any peek (the
+  // guest eats mousemove, so this is our only reliable "left the header" signal here).
+  wv.addEventListener('mouseenter', collapsePeeks);
   webviewLayer.appendChild(wv);
 
   // el/ro kept for the shared views-Map contract (destroyView calls v.ro.disconnect()).
-  v = { kind: 'webview', el: wv, wv, ro: { disconnect() {} }, slot: null, urlInput: null };
+  v = { kind: 'webview', el: wv, wv, ro: { disconnect() {} }, slot: null, urlInput: null, hotzone: null };
+  v.hotzone = makeBarHotzone(leaf);
 
   const syncUrl = (u) => {
     if (!u) return;
@@ -762,8 +812,10 @@ function mountIframeView(leaf) {
   fr.setAttribute('src', leaf.url || 'about:blank');
   fr.setAttribute('allow', 'fullscreen; clipboard-read; clipboard-write');
   fr.style.display = 'none';
+  fr.addEventListener('mouseenter', collapsePeeks);  // see the webview note above
   webviewLayer.appendChild(fr);
-  const v = { kind: 'webview', el: fr, wv: fr, ro: { disconnect() {} }, slot: null, urlInput: null, remote: true };
+  const v = { kind: 'webview', el: fr, wv: fr, ro: { disconnect() {} }, slot: null, urlInput: null, remote: true, hotzone: null };
+  v.hotzone = makeBarHotzone(leaf);
   views.set(leaf.id, v);
   return v;
 }
@@ -1375,6 +1427,7 @@ function renderPane(leaf) {
     body.appendChild(v.el);
   } else if (leaf.kind === 'webview') {
     pane.classList.add('webview-pane');
+    if (leaf.barHidden) pane.classList.add('bar-auto');
     const v = mountWebviewView(leaf);
     nameInputs.set(leaf.id, name);
 
@@ -1407,10 +1460,18 @@ function renderPane(leaf) {
     });
     v.urlInput = urlInput;
 
+    // auto-hide this pane's bar to maximize the page area; it peeks back when the cursor
+    // reaches the pane's top edge. Scoped to this pane only — nothing else is affected.
+    const fullBtn = navBtn(
+      leaf.barHidden ? 'screen-normal' : 'screen-full',
+      leaf.barHidden ? 'Εμφάνιση μπάρας' : 'Απόκρυψη μπάρας (peek στο πάνω άκρο)',
+      () => toggleBarHidden(leaf),
+    );
+
     // back/fwd + save-as-app are desktop-only (cross-origin iframe can't navigate history,
     // and the phone's browser panes are localhost-only, not arbitrary saveable sites).
     if (isRemote) {
-      bar.append(dot, colorInput, name, reload, urlInput, minBtn, fsBtn, closeBtn);
+      bar.append(dot, colorInput, name, reload, urlInput, fullBtn, minBtn, fsBtn, closeBtn);
     } else {
       const back = navBtn('arrow-left', 'Πίσω', () => { if (v.wv.canGoBack && v.wv.canGoBack()) v.wv.goBack(); });
       const fwd = navBtn('arrow-right', 'Μπροστά', () => { if (v.wv.canGoForward && v.wv.canGoForward()) v.wv.goForward(); });
@@ -1422,7 +1483,7 @@ function renderPane(leaf) {
         try { await window.termi.openLoginWindow(leaf.url); v.wv.reload(); } catch { /* */ }
       });
       const star = navBtn('star-empty', 'Αποθήκευση ως εφαρμογή', () => saveCurrentAsApp(leaf));
-      bar.append(dot, colorInput, name, back, fwd, reload, urlInput, login, star, minBtn, fsBtn, closeBtn);
+      bar.append(dot, colorInput, name, back, fwd, reload, urlInput, login, star, fullBtn, minBtn, fsBtn, closeBtn);
     }
     body.className = 'pane-body webview-body';
     const slot = document.createElement('div');
@@ -1784,6 +1845,7 @@ function closePane(leaf) {
     renderMinimizedTray();
     return;
   }
+  if (peekPaneId === leaf.id) peekPaneId = null;
   if (fullscreenId === leaf.id) fullscreenId = null;
   destroyView(leaf.id);
   if (root === leaf) {
@@ -1805,6 +1867,7 @@ function closePane(leaf) {
 // header tray; restorePane() splits it back in later, re-attaching the same session.
 function minimizePane(leaf) {
   if (minimized.includes(leaf)) return;
+  if (peekPaneId === leaf.id) peekPaneId = null;
   if (fullscreenId === leaf.id) fullscreenId = null;
   if (root === leaf) {
     root = null;            // it was the only pane -> empty workspace while it's parked
@@ -1832,6 +1895,65 @@ function restorePane(leaf) {
   focusedId = leaf.id;
   render();
   renderMinimizedTray();
+}
+
+// ---------------- per-pane bar auto-hide (browser panes) ----------------
+
+// Toggle whether THIS pane hides its own bar. When hidden the bar collapses (the page area
+// grows) and reappears only while peeking. Nothing outside this pane is affected.
+function toggleBarHidden(leaf) {
+  leaf.barHidden = !leaf.barHidden;
+  if (!leaf.barHidden && peekPaneId === leaf.id) peekPaneId = null;
+  render();   // rebuilds the bar (icon flips) + re-runs layoutWebviews (positions the hot-zone)
+}
+
+function paneEl(id) {
+  return id ? document.querySelector('.pane[data-id="' + (window.CSS ? CSS.escape(id) : id) + '"]') : null;
+}
+
+// While a pane's bar is peeking we disable its webview's pointer-events. Two wins: (1) the
+// guest no longer swallows mousemove, so the move-based hide stays reliable (no stick); and
+// (2) as the bar expands and pushes the webview down, the cursor can sweep over the (still-
+// repositioning) guest to reach the bar without a transient mouseenter collapsing the peek.
+// During a peek you use the BAR, not the page, so this is invisible in practice.
+function setPaneWebviewPE(id, val) {
+  const v = views.get(id);
+  if (v && v.wv) v.wv.style.pointerEvents = val;
+}
+
+// Reveal a hidden pane's bar (peek). Only one pane peeks at a time.
+function setBarPeek(id) {
+  if (peekPaneId === id) return;
+  if (peekPaneId) {
+    const prev = paneEl(peekPaneId);
+    if (prev) prev.classList.remove('bar-peek');
+    setPaneWebviewPE(peekPaneId, '');
+  }
+  peekPaneId = id;
+  const p = paneEl(id);
+  if (p) p.classList.add('bar-peek');
+  setPaneWebviewPE(id, 'none');
+  scheduleWebviewLayout();
+}
+
+function clearBarPeek() {
+  if (!peekPaneId) return;
+  const p = paneEl(peekPaneId);
+  if (p) p.classList.remove('bar-peek');
+  setPaneWebviewPE(peekPaneId, '');
+  peekPaneId = null;
+  scheduleWebviewLayout();
+}
+
+// Collapse any peeked header (app header AND a peeking pane bar). Used as the reliable hide
+// signal for the cases the document `mousemove` can't see: the cursor moving INTO a
+// <webview>/<iframe> (whose guest swallows mousemove so the move-based hide never fires) or
+// leaving the window entirely. Without these the peek would "stick" until you re-entered
+// host DOM — exactly the flaky behaviour we're fixing.
+function collapsePeeks() {
+  if (document.body.classList.contains('dragging')) return; // a pane drag keeps the bar up
+  if (headerHideActive) document.body.classList.remove('header-peek');
+  clearBarPeek();
 }
 
 // Sync the header tray button (hidden when nothing is minimized, otherwise shows the count).
@@ -1932,6 +2054,7 @@ function startPaneDrag(e, leaf) {
     clearDropZones();
     if (dragging && currentDrop) performDrop(leaf, currentDrop.targetId, currentDrop.zone);
     currentDrop = null;
+    clearBarPeek();   // if this came from a hidden-bar pane, drop the peek + restore its webview pointer-events
   }
   window.addEventListener('pointermove', move);
   window.addEventListener('pointerup', up);
@@ -3303,6 +3426,24 @@ window.termi.onFullscreenChange((fs) => {
   document.body.classList.toggle('header-hidden', fs);
   if (!fs) document.body.classList.remove('header-peek');
 });
+
+// Auto-hide a browser pane's bar: a per-pane hot-zone (positioned over the pane's top edge
+// by layoutWebviews, above the webview) reveals it; the global mousemove collapses it again
+// when the cursor leaves that top band — but not while the user is typing in the bar.
+document.addEventListener('mousemove', (e) => {
+  if (!peekPaneId) return;
+  if (document.body.classList.contains('dragging')) return; // keep the bar up while dragging the pane
+  const p = paneEl(peekPaneId);
+  if (!p) { clearBarPeek(); return; }
+  const bar = p.querySelector('.pane-bar');
+  if (bar && bar.contains(document.activeElement)) return; // keep the bar up while typing in it
+  const r = p.getBoundingClientRect();
+  if (e.clientX < r.left || e.clientX > r.right || e.clientY > r.top + 44) clearBarPeek();
+});
+
+// The cursor leaving the window can't produce a mousemove, so the move-based hides above
+// would leave a header stuck open. Collapse on the way out (and likewise when re-entering).
+document.documentElement.addEventListener('mouseleave', collapsePeeks);
 
 // version badge in the header (guarded: the phone bridge stubs appVersion -> 'web')
 const verEl = document.getElementById('app-version');

@@ -81,6 +81,32 @@ body.header-hidden #header-hotzone {
   position: fixed; top: 0; left: 0; right: 0;
   height: 8px; z-index: 99;
 }
+/* Per-pane bar auto-hide (browser panes): the pane's own bar collapses to give the page the
+   full area and expands back only while peeking. We collapse the bar in the flow rather than
+   overlaying it (a browser pane's <webview>/<iframe> lives in #webview-layer ABOVE the panes,
+   so an in-pane transform overlay would render behind it); the body/slot grow and the webview
+   re-glues to the slot automatically. The reveal hover is caught by a per-pane .bar-hotzone
+   that the renderer positions over the pane's top edge inside the layer (above the webview). */
+.pane.bar-auto > .pane-bar {
+  max-height: 0;
+  min-height: 0;
+  padding-top: 0; padding-bottom: 0;
+  border-bottom-width: 0;
+  overflow: hidden;
+  transition: max-height 0.13s ease-out, padding 0.13s ease-out;
+}
+.pane.bar-auto.bar-peek > .pane-bar {
+  max-height: 60px;
+  padding-top: 3px; padding-bottom: 3px;
+}
+#webview-layer .bar-hotzone {
+  position: absolute;
+  height: 14px;          /* a touch taller so it's an easy reveal + drag-grab target */
+  z-index: 2;            /* above the sibling webview/iframe in the layer */
+  pointer-events: auto;  /* the layer itself is pointer-events:none */
+  cursor: grab;          /* it doubles as the pane's drag handle while the bar is hidden */
+}
+#webview-layer .bar-hotzone:active { cursor: grabbing; }
 
 .toolbar-spacer { flex: 1 1 auto; align-self: stretch; }
 .app-version { color: var(--muted); font-size: 11px; padding: 0 8px; -webkit-app-region: no-drag; user-select: none; }
