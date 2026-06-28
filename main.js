@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, Menu, clipboard, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, Menu, clipboard, shell, session } = require('electron');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
@@ -220,6 +220,32 @@ ipcMain.handle('git:init', (e, dir) => doOp(() => simpleGit(dir).init()));
 // open a URL in the user's default (native) browser
 ipcMain.handle('shell:openExternal', (e, url) => { try { shell.openExternal(url); } catch { /* */ } });
 
+// Open a site for LOGIN in a real top-level window that shares the browser-pane
+// session ('persist:webapps'). Needed because Google Identity Services hands the
+// credential back via window.opener.postMessage, and window.opener does NOT survive
+// the <webview> → popup boundary — so OAuth can never complete inside a pane. In a
+// normal BrowserWindow the GSI popup is a real child window with a working opener, so
+// the login finishes and drops its cookie into the shared session. Resolves once the
+// window closes, so the caller can reload the pane and pick up the new login.
+ipcMain.handle('webapps:openLoginWindow', (e, url) => new Promise((resolve) => {
+  const win = new BrowserWindow({
+    width: 1024,
+    height: 800,
+    backgroundColor: '#0d1117',
+    autoHideMenuBar: true,
+    title: 'Σύνδεση',
+    webPreferences: { partition: 'persist:webapps' },
+  });
+  // Allow the GSI / OAuth popup; it inherits this window's session and a live opener.
+  win.webContents.setWindowOpenHandler(({ url: u }) => (
+    /^https?:/i.test(u)
+      ? { action: 'allow', overrideBrowserWindowOptions: { width: 520, height: 640, autoHideMenuBar: true, backgroundColor: '#0d1117' } }
+      : { action: 'deny' }
+  ));
+  win.loadURL(url || 'https://claude.ai/login');
+  win.on('closed', () => resolve({ ok: true }));
+}));
+
 ipcMain.handle('clipboard:read', () => clipboard.readText());
 ipcMain.on('clipboard:write', (e, text) => clipboard.writeText(text || ''));
 
@@ -358,13 +384,67 @@ ipcMain.on('win:fullscreen', () => {
   mainWindow.setFullScreen(!mainWindow.isFullScreen());
 });
 
-app.whenReady().then(() => {
-  Menu.setApplicationMenu(null); // remove File/Edit/View/Window/Help menu bar
-  createWindow();
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+// OAuth flows (Google "Continue with Google", etc.) open a popup via window.open.
+// An Electron <webview> swallows that unless we explicitly allow it AND give the
+// popup a real window. Without this, Claude's Google login returns to claude.ai
+// with "There was an error logging you in". The popup inherits the webview's
+// 'persist:webapps' session automatically, so the resulting auth cookie sticks.
+app.on('web-contents-created', (_event, contents) => {
+  if (contents.getType() !== 'webview') return;
+  contents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:/i.test(url)) {
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          width: 520,
+          height: 640,
+          autoHideMenuBar: true,
+          backgroundColor: '#0d1117',
+          // Do NOT override webPreferences here. The popup already inherits the
+          // webview's 'persist:webapps' session automatically, and overriding
+          // webPreferences severs window.opener — which Google Identity Services
+          // needs to postMessage the credential back to the claude.ai login page.
+        },
+      };
+    }
+    return { action: 'deny' };
+  });
+
+  contents.on('did-create-window', (popup) => {
+    popup.on('closed', () => {
+      if (!contents.isDestroyed()) { try { contents.reload(); } catch { /* */ } }
+    });
   });
 });
+
+// Allow only ONE running instance. Multiple instances share the same userData /
+// 'persist:webapps' partition and fight over the disk cache, which produces
+// "Unable to move the cache: Access denied (0x5)" + service-worker/quota DB errors
+// and breaks storage-heavy sites like claude.ai (logins never persist). A second
+// launch just focuses the existing window instead of piling up zombie processes.
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+
+  app.whenReady().then(() => {
+    Menu.setApplicationMenu(null); // remove File/Edit/View/Window/Help menu bar
+    // Plain Chrome UA (no "Electron" token) for ALL browser-pane web contents incl.
+    // OAuth popups, so Google doesn't reject the embedded session as insecure.
+    session.fromPartition('persist:webapps').setUserAgent(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+    );
+    createWindow();
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    });
+  });
+}
 
 app.on('window-all-closed', () => {
   if (remote && remote.isOpen()) { try { remote.close(); } catch { /* */ } }

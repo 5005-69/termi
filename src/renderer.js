@@ -711,6 +711,10 @@ function mountWebviewView(leaf) {
 
   const wv = document.createElement('webview');
   wv.setAttribute('partition', 'persist:webapps');  // one shared, persistent profile -> logins stick
+  // Spoof a plain Chrome UA (no "Electron" token) so Google OAuth doesn't reject the
+  // embedded webview with "There was an error logging you in" / "browser may not be secure".
+  wv.setAttribute('useragent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
+  wv.setAttribute('allowpopups', 'true');  // let OAuth (Google login) window.open popups through
   wv.setAttribute('src', leaf.url || 'about:blank');
   wv.style.display = 'none';
   webviewLayer.appendChild(wv);
@@ -1388,8 +1392,15 @@ function renderPane(leaf) {
     } else {
       const back = navBtn('arrow-left', 'Πίσω', () => { if (v.wv.canGoBack && v.wv.canGoBack()) v.wv.goBack(); });
       const fwd = navBtn('arrow-right', 'Μπροστά', () => { if (v.wv.canGoForward && v.wv.canGoForward()) v.wv.goForward(); });
+      // Google/OAuth logins (e.g. Claude) can't complete inside a <webview> because
+      // window.opener doesn't survive the popup boundary. This opens the current page
+      // in a real window that shares the pane's session; after logging in there and
+      // closing it, the pane reloads already logged in.
+      const login = navBtn('link-external', 'Σύνδεση σε ξεχωριστό παράθυρο', async () => {
+        try { await window.termi.openLoginWindow(leaf.url); v.wv.reload(); } catch { /* */ }
+      });
       const star = navBtn('star-empty', 'Αποθήκευση ως εφαρμογή', () => saveCurrentAsApp(leaf));
-      bar.append(dot, colorInput, name, back, fwd, reload, urlInput, star, fsBtn, closeBtn);
+      bar.append(dot, colorInput, name, back, fwd, reload, urlInput, login, star, fsBtn, closeBtn);
     }
     body.className = 'pane-body webview-body';
     const slot = document.createElement('div');

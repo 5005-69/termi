@@ -55,6 +55,10 @@ contextBridge.exposeInMainWorld('termi', {
   // open a URL in the native default browser
   openExternal: (url) => ipcRenderer.invoke('shell:openExternal', url),
 
+  // open a site for login in a real window sharing the pane session (for OAuth/GSI
+  // flows that can't complete inside a <webview>); resolves when the window closes.
+  openLoginWindow: (url) => ipcRenderer.invoke('webapps:openLoginWindow', url),
+
   // shared settings store (same "memory" on desktop & phone). settingsBootstrap is
   // SYNCHRONOUS so the renderer can seed localStorage before it reads it at startup.
   settingsBootstrap: () => { try { return ipcRenderer.sendSync('settings:getAll') || {}; } catch { return {}; } },
