@@ -417,8 +417,18 @@ app.on('web-contents-created', (_event, contents) => {
   });
 });
 
-// Allow only ONE running instance. Multiple instances share the same userData /
-// 'persist:webapps' partition and fight over the disk cache, which produces
+// In dev (unpackaged) run from a SEPARATE userData dir so a dev launch can live ALONGSIDE
+// the installed termi. The single-instance lock below is keyed on userData, and the
+// installed app holds the lock on the default dir (%APPDATA%/termi) -> a plain `electron .`
+// would lose the lock and quit instantly. A distinct dir gives dev its own lock AND its own
+// settings/partition, so testing changes never blocks, nor disturbs, the real app you work in.
+// Must run before requestSingleInstanceLock() and any app.getPath('userData') use.
+if (!app.isPackaged) {
+  app.setPath('userData', path.join(app.getPath('appData'), 'termi-dev'));
+}
+
+// Allow only ONE running instance (per userData). Multiple instances on the SAME userData /
+// 'persist:webapps' partition fight over the disk cache, which produces
 // "Unable to move the cache: Access denied (0x5)" + service-worker/quota DB errors
 // and breaks storage-heavy sites like claude.ai (logins never persist). A second
 // launch just focuses the existing window instead of piling up zombie processes.

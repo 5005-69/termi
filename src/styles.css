@@ -56,7 +56,8 @@ html, body {
   border-bottom: 1px solid var(--border);
   -webkit-app-region: drag; /* whole header drags the frameless window */
 }
-#toolbar button#toggleSidebar, #toolbar button#scmBtn { padding: 2px 7px; font-size: 12px; }
+/* icon-only buttons (files / source-control / mobile) share one compact size */
+#toolbar button#toggleSidebar, #toolbar button#scmBtn, #toolbar button#remoteBtn { padding: 2px 7px; font-size: 12px; }
 #toolbar button#addPane, #toolbar button#addBrowser { padding: 2px 9px; font-size: 12px; }
 #toolbar button, #toolbar .window-controls { -webkit-app-region: no-drag; }
 
@@ -83,6 +84,41 @@ body.header-hidden #header-hotzone {
 
 .toolbar-spacer { flex: 1 1 auto; align-self: stretch; }
 .app-version { color: var(--muted); font-size: 11px; padding: 0 8px; -webkit-app-region: no-drag; user-select: none; }
+
+/* Centered "minimized panes" tray — holds panes that are alive but pulled off the layout.
+   Styled as a termi chip (panel-2 / border / 6px) with an accent identity (accent chevron +
+   accent count badge). Hidden when empty. Click opens a dropdown to restore or close each. */
+.min-tray {
+  -webkit-app-region: no-drag;
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 7px 3px 9px;
+  font-size: 12px;
+  background: var(--panel-2);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
+.min-tray:hover { background: #283041; border-color: var(--accent); color: var(--text); }
+.min-tray.open { border-color: var(--accent); color: var(--text); }
+.min-tray.hidden { display: none; }
+.min-tray-label { font-weight: 600; letter-spacing: 0.2px; }
+/* VS Code-style count badge: a small rounded-rect with a subtle neutral fill (not a solid
+   blue dot), muted text that brightens with the tray on hover/open. */
+.min-tray .min-count {
+  min-width: 15px; height: 15px; padding: 0 5px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 4px;
+  background: rgba(255,255,255,0.09);
+  color: var(--muted);
+  font-size: 10px; font-weight: 600; line-height: 1;
+}
+.min-tray:hover .min-count, .min-tray.open .min-count { color: var(--text); }
+/* dropdown row: colored dot per minimized pane */
+.browser-menu .bm-item .min-dot {
+  width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto;
+  box-shadow: 0 0 0 1px rgba(0,0,0,0.3);
+}
 
 .window-controls { display: flex; align-items: stretch; height: 100%; }
 .winbtn {
@@ -394,10 +430,11 @@ body.header-hidden #header-hotzone {
 .pane-bar:active { cursor: grabbing; }
 
 /* Pane so narrow even a wrapped header won't fit: keep only the essentials
-   (maximize + close). The name field is pushed off, buttons collapse. */
+   (minimize + maximize + close). The name field is pushed off, buttons collapse;
+   the leftmost essential gets the auto margin so the trio stays grouped at the right. */
 @container (max-width: 150px) {
   .pane-bar > :not(.bar-essential) { display: none; }
-  .pane-bar > .fs-btn { margin-left: auto; }
+  .pane-bar > .min-btn { margin-left: auto; }
 }
 
 .pane-name {
@@ -437,6 +474,8 @@ body.header-hidden #header-hotzone {
 .pane-bar button:hover { background: rgba(255,255,255,0.08); color: var(--text); }
 .pane-bar button.zoom-btn { padding: 3px 4px; display: inline-flex; align-items: center; }
 .pane-bar button.zoom-btn .codicon { font-size: 14px; }
+.pane-bar button.min-btn { padding: 3px 4px; display: inline-flex; align-items: center; }
+.pane-bar button.min-btn .codicon { font-size: 13px; }
 .pane-bar button.lock-btn { padding: 3px 4px; display: inline-flex; align-items: center; }
 .pane-bar button.lock-btn .codicon { font-size: 13px; }
 .pane-bar button.lock-btn.locked { color: var(--accent); }

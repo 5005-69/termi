@@ -168,6 +168,11 @@ function whenMonaco(cb) { if (monacoReady) cb(); else monacoQueue.push(cb); }
 let root = makeLeaf();
 let focusedId = root.id;
 let fullscreenId = null;
+// Panes pulled off the layout but kept ALIVE (terminal/pty keeps running). They live in
+// the "Ελαχιστοποιημένα" header tray; their views stay in the views Map (never destroyed)
+// so restoring re-attaches the exact same session — same mechanism fullscreen uses to hide
+// the other panes without killing them.
+const minimized = [];
 
 const workspace = document.getElementById('workspace');
 const overlay = document.getElementById('overlay');
@@ -1164,6 +1169,7 @@ function swapNodes(a, b) {
 
 function visibleLeafIds() {
   if (fullscreenId) return [fullscreenId];
+  if (!root) return [];   // empty workspace (e.g. last pane minimized/closed) -> nothing visible
   const ids = [];
   (function walk(n) {
     if (n.type === 'leaf') ids.push(n.id);
@@ -1303,8 +1309,16 @@ function renderPane(leaf) {
   name.spellcheck = false;
   name.addEventListener('change', () => { leaf.name = name.value; });
 
+  const minBtn = document.createElement('button');
+  // Windows-style trio (minimize / maximize / close), all 'bar-essential' so they survive
+  // the @container collapse on very narrow panes.
+  minBtn.className = 'min-btn bar-essential';
+  minBtn.innerHTML = '<i class="codicon codicon-chrome-minimize"></i>';
+  minBtn.title = 'Ελαχιστοποίηση';
+  minBtn.addEventListener('click', (e) => { e.stopPropagation(); minimizePane(leaf); });
+
   const fsBtn = document.createElement('button');
-  // 'bar-essential' keeps these two visible even when a very narrow pane
+  // 'bar-essential' keeps these visible even when a very narrow pane
   // collapses the rest of the header onto / off the second line (styles.css @container).
   fsBtn.className = 'fs-btn bar-essential';
   fsBtn.textContent = fullscreenId === leaf.id ? '🗗' : '⛶';
@@ -1347,7 +1361,7 @@ function renderPane(leaf) {
     status.textContent = v.statusText;
     v.statusEl = status;
 
-    bar.append(dot, colorInput, name, makeLockButton(leaf), ...makeZoomButtons(leaf), ...midBtns, status, fsBtn, closeBtn);
+    bar.append(dot, colorInput, name, makeLockButton(leaf), ...makeZoomButtons(leaf), ...midBtns, status, minBtn, fsBtn, closeBtn);
     body.className = 'pane-body editor-body';
     if (v.preview) v.preview.style.fontSize = (leaf.fontSize || 13) + 'px';
     body.appendChild(v.el);
@@ -1388,7 +1402,7 @@ function renderPane(leaf) {
     // back/fwd + save-as-app are desktop-only (cross-origin iframe can't navigate history,
     // and the phone's browser panes are localhost-only, not arbitrary saveable sites).
     if (isRemote) {
-      bar.append(dot, colorInput, name, reload, urlInput, fsBtn, closeBtn);
+      bar.append(dot, colorInput, name, reload, urlInput, minBtn, fsBtn, closeBtn);
     } else {
       const back = navBtn('arrow-left', 'Πίσω', () => { if (v.wv.canGoBack && v.wv.canGoBack()) v.wv.goBack(); });
       const fwd = navBtn('arrow-right', 'Μπροστά', () => { if (v.wv.canGoForward && v.wv.canGoForward()) v.wv.goForward(); });
@@ -1400,7 +1414,7 @@ function renderPane(leaf) {
         try { await window.termi.openLoginWindow(leaf.url); v.wv.reload(); } catch { /* */ }
       });
       const star = navBtn('star-empty', 'Αποθήκευση ως εφαρμογή', () => saveCurrentAsApp(leaf));
-      bar.append(dot, colorInput, name, back, fwd, reload, urlInput, login, star, fsBtn, closeBtn);
+      bar.append(dot, colorInput, name, back, fwd, reload, urlInput, login, star, minBtn, fsBtn, closeBtn);
     }
     body.className = 'pane-body webview-body';
     const slot = document.createElement('div');
@@ -1427,7 +1441,7 @@ function renderPane(leaf) {
       if (v && v.started) window.termi.write(leaf.id, ` cd "${p}"\r`);
     });
 
-    bar.append(dot, colorInput, name, ...makeZoomButtons(leaf), launcherBtn, folderBtn, fsBtn, closeBtn);
+    bar.append(dot, colorInput, name, ...makeZoomButtons(leaf), launcherBtn, folderBtn, minBtn, fsBtn, closeBtn);
     launcherBar = launchers.length ? renderLauncherBar(leaf) : null;
     body.className = 'pane-body';
     body.appendChild(mountView(leaf).el);
@@ -1754,6 +1768,14 @@ function showInfoToast(msg) {
 }
 
 function closePane(leaf) {
+  // A minimized pane isn't in the layout tree — just drop it from the tray and kill its view.
+  const mi = minimized.indexOf(leaf);
+  if (mi !== -1) {
+    minimized.splice(mi, 1);
+    destroyView(leaf.id);
+    renderMinimizedTray();
+    return;
+  }
   if (fullscreenId === leaf.id) fullscreenId = null;
   destroyView(leaf.id);
   if (root === leaf) {
@@ -1766,6 +1788,106 @@ function closePane(leaf) {
   removeLeaf(leaf);
   if (focusedId === leaf.id) focusedId = firstLeaf(root).id;
   render();
+}
+
+// ---------------- minimize / restore ----------------
+
+// Pull a pane off the layout but keep it ALIVE (no destroyView -> the terminal/pty, editor,
+// or webview keeps running in the views Map). It moves into the centered "Ελαχιστοποιημένα"
+// header tray; restorePane() splits it back in later, re-attaching the same session.
+function minimizePane(leaf) {
+  if (minimized.includes(leaf)) return;
+  if (fullscreenId === leaf.id) fullscreenId = null;
+  if (root === leaf) {
+    root = null;            // it was the only pane -> empty workspace while it's parked
+  } else {
+    removeLeaf(leaf);
+  }
+  minimized.push(leaf);
+  if (focusedId === leaf.id) focusedId = root ? firstLeaf(root).id : null;
+  render();
+  renderMinimizedTray();
+}
+
+// Bring a minimized pane back: split it off the focused pane (or make it the root if the
+// workspace is empty) and focus it. The view is reused as-is, so the session is intact.
+function restorePane(leaf) {
+  const idx = minimized.indexOf(leaf);
+  if (idx === -1) return;
+  minimized.splice(idx, 1);
+  if (fullscreenId) fullscreenId = null;
+  if (!root) {
+    root = leaf;
+  } else {
+    splitTarget(findLeaf(focusedId) || firstLeaf(root), leaf, 'right');
+  }
+  focusedId = leaf.id;
+  render();
+  renderMinimizedTray();
+}
+
+// Sync the header tray button (hidden when nothing is minimized, otherwise shows the count).
+function renderMinimizedTray() {
+  const tray = document.getElementById('minimized-tray');
+  if (!tray) return;
+  if (!minimized.length) {
+    if (minMenuClose) minMenuClose();   // tears down the dropdown + its document listeners
+    tray.classList.add('hidden');
+    return;
+  }
+  tray.classList.remove('hidden');
+  const c = tray.querySelector('.min-count');
+  if (c) c.textContent = minimized.length;
+}
+
+// Closer for the currently-open minimized dropdown (null when none) — lets the tray button
+// toggle it shut on a second click while properly tearing down its document listeners.
+let minMenuClose = null;
+
+// Dropdown anchored to the tray button: one row per minimized pane (color dot + name);
+// click restores it, ✕ closes it for good.
+function openMinimizedMenu(anchor) {
+  document.querySelectorAll('.browser-menu').forEach((m) => m.remove());
+  if (!minimized.length) return;
+  const menu = document.createElement('div');
+  menu.className = 'browser-menu min-menu';
+
+  minimized.slice().forEach((leaf) => {
+    const it = document.createElement('div');
+    it.className = 'bm-item';
+    it.title = 'Επαναφορά';
+    const dot = document.createElement('span');
+    dot.className = 'min-dot';
+    dot.style.background = leaf.color;
+    const label = document.createElement('span');
+    label.className = 'bm-label';
+    label.textContent = leaf.name || 'pane';
+    const del = document.createElement('span');
+    del.className = 'bm-del';
+    del.textContent = '✕';
+    del.title = 'Κλείσιμο';
+    del.addEventListener('click', (e) => {
+      e.stopPropagation();
+      closePane(leaf);
+      close();
+      if (minimized.length) openMinimizedMenu(anchor);
+    });
+    it.append(dot, label, del);
+    it.addEventListener('click', (e) => { e.stopPropagation(); close(); restorePane(leaf); });
+    menu.appendChild(it);
+  });
+
+  document.body.appendChild(menu);
+  anchor.classList.add('open');   // flips the chevron + lights the border while open
+  const r = anchor.getBoundingClientRect();
+  menu.style.left = Math.min(r.left, window.innerWidth - menu.offsetWidth - 8) + 'px';
+  menu.style.top = (r.bottom + 4) + 'px';
+
+  function close() { menu.remove(); anchor.classList.remove('open'); minMenuClose = null; document.removeEventListener('pointerdown', outside, true); window.removeEventListener('keydown', esc, true); }
+  minMenuClose = close;
+  function outside(e) { if (!menu.contains(e.target) && e.target !== anchor && !anchor.contains(e.target)) close(); }
+  function esc(e) { if (e.key === 'Escape') close(); }
+  setTimeout(() => { document.addEventListener('pointerdown', outside, true); window.addEventListener('keydown', esc, true); }, 0);
 }
 
 // ---------------- drag + snap zones ----------------
@@ -3187,6 +3309,12 @@ sidebarResizer.addEventListener('pointerdown', (e) => {
   window.addEventListener('pointerup', up);
 });
 
+document.getElementById('minimized-tray').addEventListener('click', (e) => {
+  const tray = e.currentTarget;
+  // toggle: a second click on the open tray closes the dropdown (cleanly) instead of reopening
+  if (tray.classList.contains('open')) { if (minMenuClose) minMenuClose(); }
+  else openMinimizedMenu(tray);
+});
 document.getElementById('addPane').addEventListener('click', addPane);
 document.getElementById('addBrowser').addEventListener('click', (e) => openBrowserMenu(e.currentTarget));
 window.addEventListener('keydown', (e) => {
