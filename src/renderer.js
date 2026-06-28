@@ -320,6 +320,14 @@ function loadWebApps() {
 function saveWebApps() { localStorage.setItem('termi.webapps', JSON.stringify(webApps)); }
 let webApps = loadWebApps();
 
+// Auto-fetched favicon for a saved app: Google's favicon service resolves a site's logo from
+// its hostname (cached by Chromium), so we don't store anything. Returns null for unparseable
+// URLs; the <img> falls back to a globe icon on load error (offline / no favicon).
+function faviconUrl(rawUrl) {
+  try { return 'https://www.google.com/s2/favicons?sz=64&domain=' + encodeURIComponent(new URL(rawUrl).hostname); }
+  catch { return null; }
+}
+
 // What to do when a local (dev-server) URL is detected in terminal output:
 // 'ask' (prompt each time), 'pane' (always a browser pane), 'external' (native browser).
 function loadUrlAction() {
@@ -2201,7 +2209,7 @@ function openBrowserMenu(anchor) {
       del.addEventListener('click', (e) => { e.stopPropagation(); opts.onDelete(); });
       it.appendChild(del);
     }
-    menu.appendChild(it);
+    (opts.parent || menu).appendChild(it);
     return it;
   };
   const sep = () => { const s = document.createElement('div'); s.className = 'bm-sep'; menu.appendChild(s); };
@@ -2228,34 +2236,41 @@ function openBrowserMenu(anchor) {
     addItem('Νέα κενή καρτέλα', 'globe', () => { close(); openBrowserPane(); });
     if (webApps.length) {
       sep();
-      webApps.forEach((app) => {
-        addItem(app.name, 'star-full', () => { close(); openBrowserPane(app.url, app.name); }, {
-          title: app.url,
-          onDelete: () => { webApps = webApps.filter((a) => a.id !== app.id); saveWebApps(); close(); openBrowserMenu(anchor); },
-        });
-      });
+      const appsBox = document.createElement('div');
+      appsBox.className = 'bm-apps';
+      menu.appendChild(appsBox);
+      renderApps(appsBox, anchor, close);
     }
     sep();
     addItem('Προσθήκη εφαρμογής…', 'add', () => { close(); openWebAppModal({}); }, { cls: 'bm-add' });
   }
 
-  // settings (in-panel, no extra popup): how detected local URLs should open. On the
-  // phone "external" isn't possible (no reach to the PC's localhost), so it's hidden.
+  // settings (in-panel, no extra popup): how detected local URLs should open. Collapsed into
+  // a toggle so the menu stays compact. On the phone "external" isn't possible (no reach to
+  // the PC's localhost), so it's hidden.
   sep();
-  const hdr = document.createElement('div');
-  hdr.className = 'bm-head';
-  hdr.textContent = 'Τοπικά URL ανοίγουν:';
-  menu.appendChild(hdr);
+  const setHead = document.createElement('div');
+  setHead.className = 'bm-item bm-collapse-head';
+  setHead.innerHTML = '<i class="codicon codicon-chevron-right"></i><span class="bm-label">Τοπικά URL ανοίγουν</span>';
+  const setBody = document.createElement('div');
+  setBody.className = 'bm-collapse-body';
+  setHead.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const open = setBody.classList.toggle('open');
+    setHead.querySelector('.codicon').className = 'codicon codicon-chevron-' + (open ? 'down' : 'right');
+  });
+  menu.appendChild(setHead);
+  menu.appendChild(setBody);
   const optLabels = { ask: 'Ερώτηση κάθε φορά', pane: 'Πάντα σε pane', external: 'Πάντα στον browser' };
   (isRemote ? ['ask', 'pane'] : ['ask', 'pane', 'external']).forEach((opt) => {
     const it = addItem(optLabels[opt], urlAction === opt ? 'circle-filled' : 'circle-outline', () => {
       urlAction = opt; saveUrlAction();
-      // repaint the three radios in place (no menu rebuild -> no listener churn)
-      menu.querySelectorAll('.bm-item[data-opt]').forEach((row) => {
+      // repaint the radios in place (no menu rebuild -> no listener churn)
+      setBody.querySelectorAll('.bm-item[data-opt]').forEach((row) => {
         const ic = row.querySelector('.codicon');
         if (ic) ic.className = 'codicon codicon-' + (row.dataset.opt === urlAction ? 'circle-filled' : 'circle-outline');
       });
-    });
+    }, { parent: setBody });
     it.dataset.opt = opt;
   });
 
@@ -2268,6 +2283,91 @@ function openBrowserMenu(anchor) {
   function outside(e) { if (!menu.contains(e.target) && e.target !== anchor) close(); }
   function esc(e) { if (e.key === 'Escape') close(); }
   setTimeout(() => { document.addEventListener('pointerdown', outside, true); window.addEventListener('keydown', esc, true); }, 0);
+}
+
+// Render saved-app rows into `container`: auto-fetched favicon, click opens the app, ✕ deletes,
+// drag (pointer-based) reorders. `close` shuts the parent menu when an app is opened.
+function renderApps(container, anchor, close) {
+  container.innerHTML = '';
+  webApps.forEach((app) => {
+    const it = document.createElement('div');
+    it.className = 'bm-item bm-app';
+    it.dataset.appId = app.id;
+    it.title = app.url;
+
+    const fav = document.createElement('img');
+    fav.className = 'bm-favicon';
+    fav.alt = '';
+    const fu = faviconUrl(app.url);
+    if (fu) fav.src = fu;
+    // offline / no favicon -> swap the <img> for a globe codicon
+    fav.addEventListener('error', () => {
+      const icon = document.createElement('i');
+      icon.className = 'codicon codicon-globe bm-favicon';
+      fav.replaceWith(icon);
+    });
+
+    const label = document.createElement('span');
+    label.className = 'bm-label';
+    label.textContent = app.name;
+
+    const del = document.createElement('span');
+    del.className = 'bm-del'; del.textContent = '✕'; del.title = 'Διαγραφή';
+    del.addEventListener('click', (e) => {
+      e.stopPropagation();
+      webApps = webApps.filter((a) => a.id !== app.id);
+      saveWebApps();
+      if (webApps.length) renderApps(container, anchor, close);
+      else { close(); openBrowserMenu(anchor); }   // last app gone -> rebuild (drops the section)
+    });
+
+    it.append(fav, label, del);
+    attachAppRowPointer(it, app, container, close);
+    container.appendChild(it);
+  });
+}
+
+// Pointer handling for a saved-app row: a small movement threshold distinguishes a click
+// (opens the app) from a drag (reorders the list live; the new order persists on drop).
+function attachAppRowPointer(rowEl, app, container, close) {
+  rowEl.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    if (e.target.closest('.bm-del')) return;   // delete button has its own handler
+    const startX = e.clientX, startY = e.clientY;
+    let dragging = false;
+    rowEl.setPointerCapture(e.pointerId);
+
+    function move(ev) {
+      if (!dragging) {
+        if (Math.abs(ev.clientY - startY) < 5 && Math.abs(ev.clientX - startX) < 5) return;
+        dragging = true;
+        rowEl.classList.add('bm-app-dragging');
+      }
+      const others = [...container.querySelectorAll('.bm-app')].filter((r) => r !== rowEl);
+      const after = others.find((r) => {
+        const rect = r.getBoundingClientRect();
+        return ev.clientY < rect.top + rect.height / 2;
+      });
+      if (after) container.insertBefore(rowEl, after);
+      else container.appendChild(rowEl);
+    }
+    function up() {
+      try { rowEl.releasePointerCapture(e.pointerId); } catch { /* */ }
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      if (dragging) {
+        rowEl.classList.remove('bm-app-dragging');
+        const ids = [...container.querySelectorAll('.bm-app')].map((r) => r.dataset.appId);
+        webApps = ids.map((id) => webApps.find((a) => a.id === id)).filter(Boolean);
+        saveWebApps();
+      } else {
+        close();
+        openBrowserPane(app.url, app.name);
+      }
+    }
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  });
 }
 
 // Modal to define/save a web app (name + URL). Reuses the launcher modal styling.
