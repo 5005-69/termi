@@ -196,10 +196,42 @@ function loadLaunchers() {
       : { ...l, type: 'command' });
   } catch { return []; }
 }
-function saveLaunchers() {
+// A launcher item is USER content if it has no `seedId` (every seeded default carries one).
+// Used to tell an intentional "I deleted my buttons" state (seed-only / empty) apart from an
+// accidental boot-time collapse, so the self-heal below never resurrects deleted buttons.
+function hasUserContent(arr) {
+  return Array.isArray(arr) && arr.some((l) => {
+    if (l && l.type === 'category') {
+      if (!l.seedId) return true;                       // a category the user made
+      return Array.isArray(l.children) && l.children.some((c) => c && !c.seedId);
+    }
+    return !!l && !l.seedId;                             // a top-level command the user made
+  });
+}
+// Persist the launchers. We ALSO keep a rolling backup (`termi.launchers.bak`) that mirrors
+// the last state a USER action produced — seedDefaults() passes skipBackup so its automatic
+// boot-time write can never overwrite a good backup with a seed-only set. The backup is the
+// safety net the self-heal below restores from if launchers ever load collapsed.
+function saveLaunchers(skipBackup) {
   localStorage.setItem('termi.launchers', JSON.stringify(launchers));
+  if (!skipBackup) {
+    try { localStorage.setItem('termi.launchers.bak', JSON.stringify(launchers)); } catch (e) { /* */ }
+  }
 }
 let launchers = loadLaunchers();
+// SELF-HEAL: if the launchers loaded WITHOUT any user content (e.g. a stale store won the
+// load, or a boot glitch left only the seeded "AI" category) but the backup still holds real
+// buttons, restore them BEFORE seedDefaults runs. Guarded by hasUserContent on both sides so a
+// genuine "user deleted everything" state (backup also has no user content) is left untouched.
+(function selfHealLaunchers() {
+  if (hasUserContent(launchers)) return;
+  let bak = [];
+  try { bak = JSON.parse(localStorage.getItem('termi.launchers.bak') || '[]'); } catch (e) { bak = []; }
+  if (hasUserContent(bak)) {
+    launchers = bak;
+    saveLaunchers();   // write the recovered set back to localStorage + shared store, refresh backup
+  }
+})();
 
 // ---- default "AI" category, seeded once (respecting the user's edits/deletions) ----
 // Ships pre-made: one category with ready install commands per AI coding agent,
@@ -310,7 +342,7 @@ function seedDefaults() {
   }
 
   if (n) {
-    saveLaunchers();
+    saveLaunchers(true);   // skipBackup: seeding is automatic, must never clobber the user backup
     localStorage.setItem('termi.seededDefaults', JSON.stringify(store));
   }
 }

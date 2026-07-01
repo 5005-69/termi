@@ -280,6 +280,18 @@ ipcMain.on('settings:set', (e, msg) => {
     try { store.merge(app.getPath('userData'), upd); } catch { /* */ }
   }, 300);
 });
+// Flush any pending (debounced) settings write SYNCHRONOUSLY on quit. Without this, a
+// fast close within the 300ms window dropped the last writes — and since the store wins
+// on the next load, that reintroduced stale settings and could wipe buttons. before-quit
+// fires before the process tears down, so a small file write here is safe.
+function flushSettings() {
+  if (_settingsTimer) { clearTimeout(_settingsTimer); _settingsTimer = null; }
+  const upd = _settingsBuf; _settingsBuf = {};
+  if (upd && Object.keys(upd).length) {
+    try { store.merge(app.getPath('userData'), upd); } catch { /* */ }
+  }
+}
+app.on('before-quit', flushSettings);
 
 // ---------------- remote control (phone via Cloudflare tunnel) ----------------
 
